@@ -89,6 +89,13 @@ export GH_TOKEN=<你的PAT>   # 细粒度 PAT、公共仓库无需任何 scope
 python3 scripts/analyze.py owner/repo
 ```
 
+## Contributing
+
+Issues and PRs are welcome — especially a lint finding on your own README
+that turned out to be a false positive. See
+[CONTRIBUTING.md](CONTRIBUTING.md); by participating you agree to the
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
 ## Design notes
 
 - **Read-only by design** — the skill never pushes changes to your repo; all

@@ -129,7 +129,9 @@ def add_finding(findings: list, category: str, severity: str, finding: str, evid
 def score_report(markdown: str, intents: list[str] | None = None) -> dict:
     """Score README across 7 categories, total 100. Returns summary + findings."""
     intents = [t.lower() for t in (intents or [])]
-    headings = extract_headings(markdown)
+    # extract headings from fence-stripped text so bash/python comments like
+    # `# full report` inside code blocks don't count as H1s
+    headings = extract_headings(strip_code_fences(markdown))
     heading_text = [h["text"].strip().lower() for h in headings]
     images = extract_images(markdown)
     badges = [img for img in images if is_badge_url(img["url"])]
