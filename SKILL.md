@@ -3,7 +3,8 @@ name: github-repo-seo
 license: MIT
 description: >
   Analyze and optimize a GitHub repository's discoverability — GitHub in-site
-  search ranking and external search (Google/ChatGPT) indexing. Triggers when
+  search samples and repository presentation. It does not verify Google/ChatGPT
+  indexing. Triggers when
   the user mentions "检查仓库 SEO", "GitHub SEO", "优化 GitHub 可发现性",
   "repo discoverability", "README SEO 检查", "topics 优化", "分析仓库排名",
   or asks why a repo gets no traffic/stars from search. Covers metadata audit,
@@ -53,8 +54,8 @@ The script covers all five modules itself:
    topics (count + language-only detection) / staleness / trust files.
 2. **README lint** — first-screen clarity, quickstart, screenshots/GIF, badges,
    heading hierarchy, alt text. Scored 0-100 across 7 categories.
-3. **Topic-page competition (Module A)** — per topic: approximate position on
-   `github.com/topics/<t>` (via Search API `topic:<t>` best-match ordering),
+3. **Topic search samples (Module A)** — per topic: position within the returned
+   Search API `topic:<t>` best-match sample, not verified Topics-page placement,
    pool size, top-20 median stars; verdicts: keep / crowded-swap /
    niche-opportunity; plus candidate topics mined from comparable repos
    (co-occurrence).
@@ -85,8 +86,14 @@ user explicitly asks (`--save` or "落盘").
 - Never claim definitive GitHub ranking weights — scores are directional heuristics.
 - Treat API/token failures as environment limitations, not repo defects.
 - Topics stay ≤20; preserve the project's voice in rewrite suggestions.
-- Topic-page ranks are approximations (the pages are client-rendered; the
-  Search API best-match order is used as a proxy) — say so in the report.
+- Search API samples are not verified Topics-page rankings. Report sample limits
+  and unknowns; do not claim exact ranks beyond the returned sample.
+- The published v1 `crowded-swap` label does not justify removing a relevant
+  existing topic. Keep valid topics and review additions against actual capabilities.
+- Read real source and documentation before polishing drafts. Never invent
+  commands, first-hand tests, compatibility or growth claims.
+- Long-tail content should answer audience questions with original evidence and
+  known limits. Google indexing and Search Console setup require separate evidence.
 
 ## Credits
 
@@ -94,6 +101,6 @@ user explicitly asks (`--save` or "落盘").
   [Bhanunamikaze/Agentic-SEO-Skill](https://github.com/Bhanunamikaze/Agentic-SEO-Skill)
   (MIT License) — see `references/github-ranking-factors.md` and file headers.
 - Topic co-occurrence methodology after
-  [agentic-devrel/github-topic-recommender](https://github.com/agentic-devrel/github-topic-recommender) (MIT).
+  [agentic-devrel/github-topic-recommender](https://github.com/agentic-devrel/github-topic-recommender) (methodological reference).
 - Modules A (topic-page competition) and B (awesome-list matching) are original
   to this skill.

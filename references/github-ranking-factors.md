@@ -1,48 +1,60 @@
-<!-- Adapted from Bhanunamikaze/Agentic-SEO-Skill (MIT License)
-     https://github.com/Bhanunamikaze/Agentic-SEO-Skill/blob/main/resources/references/github-ranking-factors.md
-     Trimmed to factors this skill actually measures. -->
-# GitHub Repository Discoverability Factors (Practical Reference)
+# Evidence and limits for GitHub repository discoverability
 
-GitHub does not publish a full ranking formula. These are empirically useful,
-directional factors — not ranking weights.
+GitHub does not publish a complete repository-ranking formula. This project's
+published v1 score combines presentation and ecosystem heuristics; its weights
+are local product choices, not search-engine factors or a growth forecast.
 
-## High-Signal Metadata
+## Read evidence before interpreting a score
 
-- Repository name clarity and intent match (hyphen-separated tokens).
-- Description specificity and keyword fit (what-it-does words, not just a brand).
-- Topics relevance and completeness: mix broad categories + long-tail functional
-  tags; ≤20 total; don't stop at language tags.
-- Homepage URL quality (docs/demo site in the About card).
-- Social preview image for share CTR.
+Use actual repository metadata, README text, manifests and examples to check each
+finding. Structure and keyword overlap cannot prove that a capability works, a
+command is correct or a user will adopt the project. Mark unavailable API evidence
+unknown rather than concluding that a file is absent or a rank is poor.
 
-## README Signals
+The [historical case study](../docs/case-study.md) documents older rubric scores.
+Those numbers are not measured traffic, causality or a comparison with newer
+readiness rubrics. Do not update dates just to imply freshness.
 
-- Strong opening summary in the first 3-5 lines (what / for whom / why).
-- Query-aligned language for target use cases.
-- Copy-pasteable install + quickstart commands.
-- Proof of utility: screenshots, demo GIF, sample output.
-- Badge row (CI, license, stars) as an at-a-glance maintenance signal.
-- Clean heading hierarchy (single H1, no level skips) — used by search engines
-  to build structured outlines.
+## GitHub search and topics
 
-## Trust and Maintenance Signals
+[GitHub repository search](https://docs.github.com/en/search-github/searching-on-github/searching-for-repositories)
+searches name, description and topics by default. Use `in:readme` to include
+README content. Search API best-match positions are bounded observations and are
+not verified ordering on `github.com/topics/...`. An unobserved repository has
+an unknown position beyond the sample, not an exact rank of N+1.
 
-- Community profile completion (LICENSE, CONTRIBUTING, code of conduct,
-  security policy, issue templates).
-- Release cadence and push recency (freshness as a trust proxy).
-- Stars/forks as adoption proxies.
+[Topics](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/classifying-your-repository-with-topics)
+should describe actual capabilities, ecosystem and distribution type. Preserve
+relevant existing topics; the v1 collector's `crowded-swap` label does not establish
+irrelevance. Co-occurrence candidates require semantic review. GitHub allows at
+most 20 topics, using lowercase letters, numbers and hyphens.
 
-## Topic-Page Position (this skill's Module A)
+## Useful long-tail documentation
 
-- A topic page orders repos by best match; being inside the visible first page
-  (≈top 15-20) is where the discovery traffic is.
-- Competition read: pool size (repos tagged with the topic) vs. top-20 median
-  stars vs. your stars. Crowded + off-page → swap to long-tail; small pool +
-  near the page → own the niche.
-- Comparable-repo topic co-occurrence surfaces candidate tags you're missing.
+Answer questions the intended audience actually has: prerequisites, a minimal
+working path, observed output and known limits. Prefer original experience and
+clear headings over repeated keywords or speculative compatibility promises.
+[Google's helpful-content guidance](https://developers.google.com/search/docs/fundamentals/creating-helpful-content)
+is about serving readers; it does not turn a README score into proof of indexing.
 
-## Anti-Hallucination Rules
+Google Search Console website or platform-property access is a separate check.
+[Current platform-property documentation](https://support.google.com/webmasters/answer/17148418)
+lists gradually available X, Instagram, TikTok and YouTube properties. GitHub repo
+URLs are not in that list. A user's controlled Pages site/domain can have its own
+website verification. Do not configure properties or publish X drafts without an
+explicit request.
 
-- Never claim definitive ranking weights.
-- Distinguish observed evidence from inferred hypothesis.
-- Mark API-limited sections as unknown, not failed.
+## Awesome-list candidates and promotion
+
+A list-name match alone cannot establish an eligible section or accepted entry.
+Read the list and contribution rules, check the exact repository URL for existing
+inclusion, and keep submissions as drafts. No score guarantees acceptance or stars.
+Only send submissions when the user authorizes that action.
+
+## What was not measured
+
+The collector does not verify Google/ChatGPT indexing, Google ranking, X impressions
+or optimization-driven adoption. Repository traffic and compatible future search
+samples need real observations; publishing a repository or improving documentation
+is not proof that traffic increased. Do not combine overlapping traffic windows or
+claim that a referrer identifies a search query or proves causality.

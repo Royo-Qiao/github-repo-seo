@@ -1,3 +1,5 @@
+> Historical v1 report retained as an output example. Scores are presentation/ecosystem heuristics, not measured growth. Search API samples do not establish verified Topics-page rankings; API-null community fields do not prove every supported template location is empty.
+
 # GitHub 可发现性分析报告 — Royo-Qiao/Cloudflare-Edgetunnel
 
 > 生成时间: 2026-09-28T07:23:46+00:00 | 认证方式: token | 分析脚本: github-repo-seo skill

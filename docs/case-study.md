@@ -1,3 +1,5 @@
+> Historical case study: rubric scores and submission status describe the recorded session, not verified current ranking, traffic growth or acceptance.
+
 # Case study: Cloudflare-Edgetunnel, 61 → 82 → 93
 
 This is the skill's first real-world run, applied to its own author's repo
