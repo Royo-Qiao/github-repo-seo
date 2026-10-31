@@ -17,6 +17,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -245,112 +246,140 @@ def _http(method: str, url: str, params: dict | None, body: dict | None,
         return exc.code, exc.headers, (exc.read() or b"").decode("utf-8", errors="replace")
 
 
-def _gh_api_json(path: str, params: dict | None = None, timeout: int = 30,
-                 method: str = "GET", body: dict | None = None) -> dict:
-    """Call the API via `gh api` (uses the CLI's own auth)."""
+# State is shared by all collectors in this process, never persisted with credentials.
+_COOLDOWNS: dict[str, float] = {}
+_LAST_SEARCH: float | None = None
+
+
+def _wait(seconds: float, reason: str) -> None:
+    if seconds > 0:
+        print(f"[github-api] {reason}; waiting {seconds:.1f}s", file=sys.stderr, flush=True)
+        time.sleep(seconds)
+
+
+def _before_request(bucket: str, authenticated: bool) -> None:
+    global _LAST_SEARCH
+    for key in ("all", bucket):
+        remaining = _COOLDOWNS.get(key, 0) - time.time()
+        if remaining > MAX_RETRY_WAIT:
+            raise GitHubAPIError("GitHub rate-limit cooldown active; request skipped.", status=429,
+                                 details={"retry_after_seconds": round(remaining, 1), "resource": key})
+        if remaining > 0:
+            _wait(remaining, f"{key} cooldown")
+            _COOLDOWNS.pop(key, None)
+    if bucket == "search":
+        interval = 3.1 if authenticated else 6.1
+        if _LAST_SEARCH is not None:
+            _wait(max(0, interval - (time.monotonic() - _LAST_SEARCH)), "shared search pacing")
+        _LAST_SEARCH = time.monotonic()
+
+
+def _gh_http(path: str, params: dict | None, timeout: int,
+             method: str, body: dict | None) -> tuple[int, dict, str]:
+    """Keep status/headers on both successful and failed gh requests."""
     if not gh_available():
         raise GitHubAPIError("GitHub CLI (`gh`) is not available.")
     endpoint = path.replace(API_BASE, "", 1).lstrip("/")
-    cmd = ["gh", "api", endpoint, "--method", method.upper()]
-    input_data = None
+    cmd = ["gh", "api", endpoint, "--include", "--method", method.upper()]
+    data = None
     if body is not None:
         cmd += ["--input", "-"]
-        input_data = json.dumps(body)
+        data = json.dumps(body)
     else:
         for key, value in (params or {}).items():
             cmd += ["-f", f"{key}={value}"]
     try:
-        result = subprocess.run(cmd, input=input_data, capture_output=True, text=True,
+        result = subprocess.run(cmd, input=data, capture_output=True, text=True,
                                 timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
         raise GitHubAPIError(f"gh api timed out after {timeout}s") from exc
-    if result.returncode != 0:
-        raise GitHubAPIError(f"gh api error: {(result.stderr or '').strip() or 'unknown'}")
-    payload = (result.stdout or "").strip()
-    return json.loads(payload) if payload else {}
+    output = (result.stdout or "").replace("\r\n", "\n")
+    # Redirects can produce multiple HTTP header blocks. Decode the final one.
+    status, headers = None, {}
+    while output.startswith("HTTP/"):
+        head, separator, rest = output.partition("\n\n")
+        match = re.match(r"HTTP/\S+ (\d{3})", head)
+        if not match or not separator:
+            break
+        status = int(match.group(1))
+        headers = dict(line.split(":", 1) for line in head.splitlines()[1:] if ":" in line)
+        headers = {key.strip().lower(): value.strip() for key, value in headers.items()}
+        output = rest
+    if status is None or (result.returncode and status < 400):
+        raise GitHubAPIError("gh api failed without an HTTP error response.")
+    return status, headers, output
 
 
-def fetch_json(
-    path: str,
-    token: str = "",
-    params: dict | None = None,
-    provider: str = "auto",
-    timeout: int = 25,
-    retries: int = 2,
-    method: str = "GET",
-    body: dict | None = None,
-) -> dict:
-    """Fetch a GitHub API endpoint and return the parsed payload.
+def _gh_api_json(path: str, params: dict | None = None, timeout: int = 30,
+                 method: str = "GET", body: dict | None = None) -> dict:
+    return fetch_json(path, params=params, timeout=timeout, method=method, body=body, provider="gh")
 
-    provider:
-      auto  - REST with token when present, else `gh api` when authenticated,
-              else unauthenticated REST (subject to 60 req/h limit).
-      api   - REST only.
-      gh    - `gh api` only.
 
-    method/body: defaults to GET; pass method="PATCH" with body for updates
-    (e.g. repo description). Mutating calls require token or gh auth.
-    Gotcha: PATCH /repos silently ignores the `topics` field — use the
-    dedicated PUT /repos/{owner}/{repo}/topics with body {"names": [...]}.
+def fetch_json(path: str, token: str = "", params: dict | None = None,
+               provider: str = "auto", timeout: int = 25, retries: int = 2,
+               method: str = "GET", body: dict | None = None) -> dict:
+    """Shared pacing/retries for REST and gh. No provider switching on throttling.
 
-    Raises GitHubAPIError on terminal failure.
+    A single wait is bounded by MAX_RETRY_WAIT. Longer delays are retained as
+    process-local cooldowns so later collectors fail explicitly without HTTP.
+    Independent processes/accounts are not coordinated by this helper.
     """
     mode = (provider or "auto").lower()
-    if mode == "gh":
-        return _gh_api_json(path, params=params, timeout=timeout, method=method, body=body)
-
+    use_gh = mode == "gh" or (mode == "auto" and not token and gh_authenticated())
     url = path if path.startswith("http") else f"{API_BASE}{path}"
-    use_token = token
-    if mode == "auto" and not token and gh_authenticated():
+    bucket = "search" if urllib.parse.urlparse(url).path.startswith("/search/") else "core"
+    for attempt in range(retries + 1):
+        _before_request(bucket, bool(token) or use_gh)
         try:
-            return _gh_api_json(path, params=params, timeout=timeout, method=method, body=body)
-        except GitHubAPIError:
-            pass  # fall through to unauthenticated REST
-
-    attempt = 0
-    while True:
-        try:
-            status, resp_headers, text = _http(method.upper(), url, params, body,
-                                               _headers(use_token), timeout)
-        except (urllib.error.URLError, OSError) as exc:  # DNS / refused / timed out
-            if attempt < retries:
-                time.sleep(2 ** attempt)
-                attempt += 1
+            if use_gh:
+                status, response_headers, text = _gh_http(path, params, timeout, method, body)
+            else:
+                status, response_headers, text = _http(method.upper(), url, params, body, _headers(token), timeout)
+        except (urllib.error.URLError, OSError) as exc:
+            if attempt < retries and method.upper() in ("GET", "HEAD"):
+                _wait(2 ** attempt, "network retry")
                 continue
-            raise GitHubAPIError(f"Network error calling GitHub API: {exc}") from exc
-
-        if status < 400:
-            return json.loads(text) if text.strip() else {}
-
+            raise GitHubAPIError("Network error calling GitHub API") from exc
+        headers = {key.lower(): value for key, value in response_headers.items()}
+        remaining = headers.get("x-ratelimit-remaining")
+        reset = headers.get("x-ratelimit-reset")
+        retry_after = headers.get("retry-after")
         try:
-            detail = json.loads(text)
+            detail = json.loads(text) if text.strip() else {}
         except ValueError:
-            detail = {"raw": text[:500]}
-        message = detail.get("message", f"GitHub API error: HTTP {status}")
-        remaining = resp_headers.get("X-RateLimit-Remaining")
-        reset = resp_headers.get("X-RateLimit-Reset")
-        retry_after = resp_headers.get("Retry-After")
-        secondary = status == 403 and (retry_after is not None or "secondary rate limit" in message.lower())
-        retryable = status in (429, 500, 502, 503, 504) or secondary or (status == 403 and remaining == "0")
-        if attempt < retries and retryable:
-            wait = 60 if secondary else 2 ** attempt + 1
+            raise GitHubAPIError("GitHub returned non-JSON response", status=status)
+        if status < 400:
+            if remaining == "0":
+                try:
+                    _COOLDOWNS[bucket] = max(time.time(), float(reset)) + 1
+                except (ValueError, TypeError):
+                    _COOLDOWNS[bucket] = time.time() + 60
+            return detail
+        message = detail.get("message", f"GitHub API error: HTTP {status}") if isinstance(detail, dict) else f"HTTP {status}"
+        limited = status == 429 or (status == 403 and (remaining == "0" or retry_after is not None or "rate limit" in message.lower()))
+        if limited:
+            wait = 60 * (2 ** attempt)
+            key = "all" if status == 429 or retry_after is not None or "secondary" in message.lower() else bucket
             if retry_after is not None:
                 try:
                     wait = max(0, float(retry_after))
                 except ValueError:
                     try:
-                        retry_at = parsedate_to_datetime(retry_after)
-                        wait = max(0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+                        wait = max(0, (parsedate_to_datetime(retry_after) - datetime.now(timezone.utc)).total_seconds())
                     except (ValueError, TypeError, OverflowError):
                         pass
             elif remaining == "0" and reset:
                 try:
-                    wait = max(1, int(reset) - int(time.time()) + 1)
+                    wait = max(1, float(reset) - time.time() + 1)
                 except ValueError:
                     pass
-            if wait <= MAX_RETRY_WAIT:
-                time.sleep(wait)
-                attempt += 1
+            _COOLDOWNS[key] = time.time() + wait
+            if attempt < retries and wait <= MAX_RETRY_WAIT and method.upper() in ("GET", "HEAD"):
+                _wait(wait, f"HTTP {status} rate limit")
+                _COOLDOWNS.pop(key, None)
                 continue
-            detail["retry_after_seconds"] = wait
-        raise GitHubAPIError(message, status=status, details=detail)
+            raise GitHubAPIError(message, status=status, details={"retry_after_seconds": wait, "resource": key})
+        if status in (500, 502, 503, 504) and attempt < retries and method.upper() in ("GET", "HEAD"):
+            _wait(2 ** attempt + 1, "server retry")
+            continue
+        raise GitHubAPIError(message, status=status, details=detail if isinstance(detail, dict) else {})

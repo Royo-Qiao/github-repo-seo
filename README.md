@@ -90,6 +90,71 @@ remain user-provided claims until checked against the project. The agent complet
 the semantic review and natural copy using the actual README, manifests, and examples;
 the scripts do not execute the target project's program.
 
+### Real audit output
+
+The following is an excerpt from an actual online run on **2026-10-31**, using
+commit `c5df577` against this repository, before this output section was added:
+
+```bash
+python3 scripts/analyze.py Royo-Qiao/github-repo-seo --provider gh \
+  --project-type skill --query "GitHub repository discoverability in:readme" \
+  --query "README topics audit in:readme" --json
+```
+
+```json
+{
+  "repo": "Royo-Qiao/github-repo-seo",
+  "generated_at_utc": "2026-10-31T04:35:08+00:00",
+  "rubric_version": "readiness-v2",
+  "overall": {
+    "score": 98,
+    "rating": "Excellent",
+    "weights": {
+      "metadata": 0.35,
+      "readme": 0.4,
+      "topic_structure": 0.25
+    },
+    "evaluated_weight": 1.0,
+    "status": "ok"
+  },
+  "module_scores": {
+    "metadata": 100,
+    "readme": 95,
+    "topic_structure": 100
+  }
+}
+```
+
+The result is historical, not an expected score for another run. Both explicit
+queries returned complete 100-result samples without this repository appearing
+in those samples. Awesome-list discovery was partial: seven of eight discovery
+queries hit GitHub's rate limit, while five candidate READMEs were inspected.
+This observed failure motivated the shared rate-limit handling described below.
+The sample does not demonstrate Google indexing, traffic growth or exact ranks
+outside the returned search window.
+
+### Rate limits and progress
+
+REST and `--provider gh` share process-local search pacing and retry handling.
+The CLI transport retains HTTP headers even for errors. Search calls are spaced
+at least 3.1 seconds apart when authenticated and 6.1 seconds without a token;
+existing module pauses may make them slower. Server headers take precedence:
+`Retry-After`, then the exhausted budget's `X-RateLimit-Reset`, otherwise at least
+60 seconds for a rate-limit response. Repeated headerless limits back off further.
+
+Each individual wait is capped at 60 seconds and retry counts remain bounded.
+When the server requires a longer wait, the collector retains a cooldown and
+marks affected checks unavailable rather than retrying early. Primary limits
+block their resource bucket; secondary limits block all requests in this process.
+Progress goes to stderr, keeping JSON on stdout parseable. Rate limiting never
+triggers an anonymous/provider fallback, and mutating calls are not auto-replayed.
+
+Separate CLI processes and other tools share GitHub account limits but do not
+share this in-memory limiter. No guarantee of avoiding all 403/429 responses is
+made. Readiness can remain available while search/opportunity checks are partial;
+inspect their status and limitations. See
+[GitHub's API guidance](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api).
+
 ### Plan content around real search questions
 
 Before publication, map audience questions to the actual local documentation:

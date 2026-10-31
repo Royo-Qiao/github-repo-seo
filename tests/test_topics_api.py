@@ -39,6 +39,10 @@ class RepositoryIdentifierTests(unittest.TestCase):
 
 
 class ApiRetryTests(unittest.TestCase):
+    def setUp(self):
+        github_api._COOLDOWNS.clear()
+        github_api._LAST_SEARCH = None
+
     def test_status_code_alias_preserves_status(self):
         error = github_api.GitHubAPIError("not found", status=404)
         self.assertEqual(error.status_code, 404)

@@ -46,6 +46,12 @@ Without authentication, collect available basic metadata/README evidence and
 explicitly mark skipped search/topic/awesome checks unknown. Do not stop the basic
 audit or score missing API evidence as a repository defect. Never print a token.
 
+Rate-limit handling is shared across collectors and REST/gh transports within
+one process. Respect progress/cooldown diagnostics on stderr; long server waits
+produce explicit unavailable checks. Do not switch credentials/providers or
+restart collectors to bypass a cooldown. Other processes are not coordinated.
+Readiness and a successful CLI exit do not mean every discovery request succeeded.
+
 ## Select the scope
 
 Existing options remain available: `--json`, `--save PATH`, `--provider auto|api|gh`,
