@@ -1,0 +1,43 @@
+name: Offline checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Discover and run standard-library tests without network or credentials
+        env:
+          GH_TOKEN: ''
+          GITHUB_TOKEN: ''
+          GH_CONFIG_DIR: ${{ runner.temp }}/offline-gh-config
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          python - <<'PY'
+          from contextlib import ExitStack
+          import sys
+          import unittest
+          from unittest.mock import patch
+
+          with ExitStack() as guards:
+              for target in ('socket.create_connection', 'socket.socket.connect',
+                             'urllib.request.urlopen', 'subprocess.Popen'):
+                  guards.enter_context(patch(target, side_effect=AssertionError('Offline tests forbid real I/O: ' + target)))
+              suite = unittest.defaultTestLoader.discover('tests')
+              result = unittest.TextTestRunner(verbosity=2).run(suite)
+          sys.exit(0 if result.wasSuccessful() else 1)
+          PY

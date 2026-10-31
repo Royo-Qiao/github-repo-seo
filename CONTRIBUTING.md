@@ -1,35 +1,42 @@
 # Contributing to github-repo-seo
 
-Thanks for taking the time to contribute! :sparkles:
+## Development setup
 
-## Development Setup
-
-Requirements: Python 3.10+ (stdlib only — no virtualenv needed) and a GitHub
-token (`export GH_TOKEN=<pat>` or `gh auth login`).
+Python 3.10+; runtime and tests use the standard library. No token or network access
+is required for the offline test suite:
 
 ```bash
 git clone https://github.com/Royo-Qiao/github-repo-seo.git
 cd github-repo-seo
-python3 scripts/repo_audit.py octocat/Hello-World   # smoke test, ~2 API calls
+python3 -m unittest discover -s tests -v
 ```
 
-## Pull Requests
+For reproducible old/new collector comparisons, see
+[the offline regression cases](evals/README.md). These checks exercise scripts;
+they do not measure model output quality or publicity growth.
 
-1. Create your branch from `main`.
-2. Keep changes focused — one concern per PR.
-3. Each script under `scripts/` must stay independently runnable and
-   stdlib-only (no third-party imports).
-4. Verify the module you touched still runs cleanly against a public repo
-   (e.g. `octocat/Hello-World`).
-5. By participating, you agree to the [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+A real API smoke test is optional. It reads GitHub data and may require an existing
+`gh` login or `GH_TOKEN` / `GITHUB_TOKEN`; keep credentials out of reports and tests:
 
-## Reporting Issues
+```bash
+python3 scripts/repo_audit.py octocat/Hello-World --json
+```
 
-Please include:
+## Pull requests
 
-- the command you ran and the repo (or README) it failed on
-- expected vs. actual output
-- Python version and OS
+1. Branch from `main` and keep each change focused.
+2. Keep scripts independently runnable and standard-library-only.
+3. Run the offline suite. Add regression cases for behavior changes, especially
+   partial API failures, missing permissions, incomplete samples, and unknown data.
+4. Preserve the evidence boundaries: a read failure is not absence; readiness is
+   not rank/growth; topics and copy must be supported by project facts.
+5. Keep documentation and CLI examples aligned. Tests must not publish, submit PRs,
+   execute target-project programs, or depend on live search ordering.
 
-False-positive lint findings are bugs too — please open an issue with the
-README excerpt that triggered them.
+By participating, you agree to [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
+## Reporting issues
+
+Include the command, repository or relevant README excerpt, expected/actual result,
+Python version, and OS. Share redacted errors and observation metadata where useful;
+never include tokens. False-positive findings and ungrounded drafts are bugs too.

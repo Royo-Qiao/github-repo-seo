@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-Module A: Topic-page competition analysis.
+Module A: Topic structure checks and GitHub Search API samples.
 
-For each of the repo's topics, estimate its position on github.com/topics/<topic>
-via the GitHub Search API (q=topic:<t>, default best-match ordering — the same
-index that renders the topic page; the page itself is client-rendered React and
-no longer exposes ranks/stars in server HTML). Then classify topics as
-keep / crowded-swap / niche-opportunity, and mine comparable repos' topics for
-add/replace candidates (co-occurrence methodology after
-agentic-devrel/github-topic-recommender, MIT).
+For each topic, observe the first N Search API results for q=topic:<t>.
+This is not an observation of the Topics page or a prediction of traffic.
+Co-occurring tags are candidates requiring project-specific review, not
+automatic replacements (co-occurrence methodology after
+agentic-devrel/github-topic-recommender; methodological reference, license unverified).
 
 Standalone usage:
   python topic_competition.py owner/repo [--json]
@@ -23,13 +21,14 @@ import re
 import statistics
 import sys
 import time
+from datetime import datetime, timezone
 
 from github_api import GitHubAPIError, fetch_json, get_token, resolve_repo
 from repo_audit import LANGUAGE_TOPICS, tokenize
 
 SEARCH_PAUSE = 1.2  # be polite to the search API secondary rate limit
 
-# Topics that add no search value — too vague to match any real query intent.
+# Generic label patterns; this list cannot establish semantic relevance.
 TOPIC_GENERIC_WORDS = {
     "tool", "tools", "app", "apps", "application", "applications", "project",
     "projects", "code", "coding", "awesome", "demo", "demos", "sample",
@@ -39,19 +38,23 @@ TOPIC_GENERIC_WORDS = {
 }
 
 
-def quality_score(topics: list[str]) -> tuple[int, list[str]]:
-    """Score fully-controllable topic quality (0-100) + human-readable notes.
-
-    Factors: presence, count in the 5-15 sweet spot, share of precise
-    functional tags, and generic-blacklist hits.
-    """
+def structure_score(topics: list[str]) -> tuple[int, list[str]]:
+    """Score topic syntax and label coverage, never semantic relevance."""
+    notes = ["Structure/syntax coverage only; semantic relevance requires project-specific review."]
     if not topics:
-        return 10, ["No topics configured — the biggest controllable gap."]
+        return 10, notes + ["No topics configured."]
     lowered = [t.lower() for t in topics]
     functional = [t for t in lowered if t not in LANGUAGE_TOPICS and t not in TOPIC_GENERIC_WORDS]
     generics = [t for t in lowered if t in TOPIC_GENERIC_WORDS]
-    notes = []
     score = 100
+
+    invalid = [t for t in topics if not re.fullmatch(r"[a-z0-9-]{1,50}", t)]
+    if invalid:
+        score -= 20 * len(invalid)
+        notes.append(f"Invalid topic syntax: {', '.join(repr(t) for t in invalid)}; use 1-50 lowercase letters, digits or hyphens.")
+    if len(lowered) != len(set(lowered)):
+        score -= 10
+        notes.append("Duplicate topics detected.")
 
     n = len(topics)
     if n < 3:
@@ -60,16 +63,19 @@ def quality_score(topics: list[str]) -> tuple[int, list[str]]:
     elif n < 5:
         score -= 10
         notes.append(f"Topic count on the thin side ({n}) — aim for 5-15.")
+    elif n > 20:
+        score -= 20
+        notes.append(f"Topic count exceeds GitHub's 20-topic limit ({n}).")
     elif n > 15:
         score -= 5
         notes.append(f"Topic count on the high side ({n}) — trim toward ≤15 focused tags.")
 
     if not functional:
         score -= 30
-        notes.append("No precise functional tags (all topics are language names or generic words).")
+        notes.append("All labels match the language/framework or generic-word lists; review coverage of use-case labels.")
     elif len(functional) < 3:
         score -= 12
-        notes.append(f"Only {len(functional)} precise functional tag(s) — aim for ≥3.")
+        notes.append(f"Only {len(functional)} label(s) outside the language/framework and generic-word lists; review use-case coverage.")
 
     if generics:
         score -= 8 * len(generics)
@@ -78,13 +84,19 @@ def quality_score(topics: list[str]) -> tuple[int, list[str]]:
     return max(0, min(100, score)), notes
 
 
-def ranking_score(per_topic: list[dict]) -> int:
-    """Score estimated topic-page visibility (0-100). Semi-controllable, approximate."""
-    verdict_points = {"keep-strong": 100, "keep": 85, "niche-opportunity": 90,
-                      "off-page": 55, "crowded-swap": 30, "unknown": 50}
-    scored = [verdict_points.get(e["verdict"], 50) for e in per_topic if e["verdict"] != "error"]
+def quality_score(topics: list[str]) -> tuple[int, list[str]]:
+    """Compatibility alias for the structure/syntax rubric."""
+    return structure_score(topics)
+
+
+def ranking_score(per_topic: list[dict]) -> int | None:
+    """Descriptive Search API sample score; unavailable observations have no score."""
+    verdict_points = {"observed-top10": 100, "observed-in-sample": 85,
+                      "small-pool-unobserved": 55, "off-sample": 55, "crowded-unobserved": 30}
+    scored = [verdict_points[e["verdict"]] for e in per_topic
+              if e.get("status") == "ok" and e.get("verdict") in verdict_points]
     if not scored:
-        return 0
+        return None
     return round(statistics.mean(scored))
 
 
@@ -99,16 +111,53 @@ def _search_repos(query: str, token: str, provider: str,
     return fetch_json("/search/repositories", token=token, params=params, provider=provider, timeout=35)
 
 
+def _sample_data(payload: dict, limit: int) -> tuple[list, int | None, bool | None, list[str]]:
+    """Keep observed items separate from missing totals/completeness metadata."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+        raise GitHubAPIError("Search response does not contain a result sample.")
+    items = payload["items"][:limit]
+    raw_total = payload.get("total_count")
+    total = raw_total if isinstance(raw_total, int) and not isinstance(raw_total, bool) and raw_total >= 0 else None
+    raw_flag = payload.get("incomplete_results")
+    flag = raw_flag if isinstance(raw_flag, bool) else None
+    problems = []
+    if total is None:
+        problems.append("Search response has no valid total_count")
+    if flag is None:
+        problems.append("Search response has no completeness flag")
+    elif flag:
+        problems.append("GitHub marked these search results incomplete")
+    if total is not None and len(items) != min(total, limit):
+        problems.append("Returned sample is shorter than the requested result window")
+    if any(not isinstance(item, dict) or not isinstance(item.get("full_name"), str)
+           or not item["full_name"] for item in items):
+        problems.append("Search sample contains an invalid repository entry")
+    return items, total, flag, problems
+
+
 def analyze_single_topic(topic: str, repo: str, our_stars: int,
                          token: str, provider: str, top_n: int) -> dict:
-    """Rank + leaders + verdict for one topic."""
+    """Observe one Search API sample and a separately star-sorted sample."""
     entry = {
         "topic": topic,
+        "query": f"topic:{topic}",
+        "sort": "best-match",
+        "observed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "sample_limit": top_n,
+        "sampled_count": None,
+        "incomplete_results": None,
+        "status": "unavailable",
         "pool_total": None,
         "best_match_rank": None,
         "in_top_n": False,
         "top_repos": [],
-        "median_stars_top20": None,
+        "star_query": f"topic:{topic}",
+        "star_sort": "stars",
+        "star_observed_at": None,
+        "star_sample_limit": top_n,
+        "star_sampled_count": None,
+        "star_incomplete_results": None,
+        "median_stars_sample": None,
         "top1_stars": None,
         "verdict": "unknown",
         "advice": "",
@@ -116,102 +165,159 @@ def analyze_single_topic(topic: str, repo: str, our_stars: int,
     }
     try:
         best = _search_repos(f"topic:{topic}", token, provider, per_page=top_n)
+        items, total, complete_flag, problems = _sample_data(best, top_n)
     except GitHubAPIError as exc:
         entry["error"] = str(exc)
         entry["verdict"] = "error"
         return entry
 
-    entry["pool_total"] = best.get("total_count", 0)
-    items = best.get("items") or []
+    entry["pool_total"] = total
+    entry["sampled_count"] = len(items)
+    entry["incomplete_results"] = complete_flag
+    entry["status"] = "partial" if problems else "ok"
+    if problems:
+        entry["error"] = "best-match sample: " + "; ".join(problems)
     for idx, item in enumerate(items, start=1):
+        if not isinstance(item, dict) or not isinstance(item.get("full_name"), str):
+            continue
         entry["top_repos"].append({
             "full_name": item.get("full_name"),
-            "stars": item.get("stargazers_count", 0),
+            "stars": item.get("stargazers_count"),
             "description": (item.get("description") or "")[:110],
         })
         if (item.get("full_name") or "").lower() == repo.lower():
             entry["best_match_rank"] = idx
 
-    stars_list = [r["stars"] for r in entry["top_repos"]]
-    if stars_list:
-        entry["top1_stars"] = stars_list[0]
     try:
+        entry["star_observed_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
         starred = _search_repos(f"topic:{topic}", token, provider, per_page=top_n, sort="stars")
-        star_items = starred.get("items") or []
-        star_vals = [i.get("stargazers_count", 0) for i in star_items]
-        if star_vals:
-            entry["median_stars_top20"] = int(statistics.median(star_vals))
+        star_items, _, star_flag, star_problems = _sample_data(starred, top_n)
+        entry["star_sampled_count"] = len(star_items)
+        entry["star_incomplete_results"] = star_flag
+        star_vals = [item.get("stargazers_count") for item in star_items if isinstance(item, dict)]
+        valid_stars = len(star_vals) == len(star_items) and all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in star_vals)
+        if not valid_stars:
+            star_problems.append("Star sample contains missing or invalid star counts")
+        if star_problems:
+            entry["status"] = "partial"
+            entry["error"] = "; ".join(filter(None, [entry["error"], "star sample: " + "; ".join(star_problems)]))
+        if star_vals and valid_stars:
+            entry["median_stars_sample"] = statistics.median(star_vals)
             entry["top1_stars"] = star_vals[0]
     except GitHubAPIError as exc:
-        entry["error"] = f"star-sorted query failed: {exc}"
+        entry["error"] = "; ".join(filter(None, [entry["error"], f"star-sorted query failed: {exc}"]))
+        entry["status"] = "partial"
 
     # ---- verdict ----
+    if entry["status"] != "ok":
+        entry["advice"] = "Search observations are partial; no ranking or competition conclusion was drawn."
+        return entry
     rank = entry["best_match_rank"]
     pool = entry["pool_total"] or 0
-    median = entry["median_stars_top20"]
+    median = entry["median_stars_sample"]
     entry["in_top_n"] = rank is not None
 
     if rank is not None and rank <= 10:
-        entry["verdict"] = "keep-strong"
-        entry["advice"] = f"Hold position: ranks ~#{rank} on the topic page — a real traffic source."
+        entry["verdict"] = "observed-top10"
+        entry["advice"] = f"Observed at #{rank} in this Search API sample; this does not establish Topics-page placement or traffic."
     elif rank is not None and rank <= top_n:
-        entry["verdict"] = "keep"
-        entry["advice"] = f"Visible (rank ~#{rank}/{top_n}); stars/README improvements can push it into the top 10."
+        entry["verdict"] = "observed-in-sample"
+        entry["advice"] = f"Observed at #{rank} in the first {top_n} Search API results; keep the tag when it accurately describes the project."
     elif rank is None and pool and pool < 120:
-        entry["verdict"] = "niche-opportunity"
-        entry["advice"] = (f"Small topic (only ~{pool} repos) and you're just outside the visible page — "
-                           "a few stars/README pushes can own this long-tail term.")
+        entry["verdict"] = "small-pool-unobserved"
+        entry["advice"] = f"Small reported pool (~{pool} repositories), but the repo was not observed in the first {top_n} results; its position beyond the sample is unknown."
     elif pool and pool >= 500 and (median is None or our_stars < max(10, (median or 0) * 0.25)):
-        entry["verdict"] = "crowded-swap"
-        entry["advice"] = (f"Crowded topic (~{pool} repos, top-20 median ≈{median}⭐ vs your {our_stars}⭐) "
-                           "and the repo is off the visible page — consider swapping for a narrower long-tail topic.")
+        entry["verdict"] = "crowded-unobserved"
+        entry["advice"] = (f"Large reported pool (~{pool} repos); star sample median={median} across {entry['star_sampled_count']} results vs your {our_stars}. "
+                           "Not observed in the best-match sample; crowding alone is not a reason to remove a relevant tag.")
     elif rank is None:
-        entry["verdict"] = "off-page"
-        entry["advice"] = f"Not in the topic page top {top_n}; improve stars/README or replace with a less contested topic."
+        entry["verdict"] = "off-sample"
+        entry["advice"] = f"Not observed in the first {top_n} Search API results; no Topics-page placement or growth effect was measured."
     return entry
 
 
 def discover_candidate_topics(keywords: list[str], exclude: set[str], token: str,
                               provider: str, max_keywords: int = 3,
-                              comparable_per_kw: int = 8) -> dict:
-    """Mine topics used by comparable repos (co-occurrence) as add/replace candidates."""
+                              comparable_per_kw: int = 8, repo: str = "",
+                              evidence_text: str = "") -> dict:
+    """Mine unique non-fork, active repository tags for manual relevance review."""
     from collections import Counter
     cooccurrence = Counter()
     evidence: dict[str, list[str]] = {}
-    comparables: list[dict] = []
+    comparables: dict[str, dict] = {}
     errors = []
+    observations = []
+    attempted = succeeded = 0
+    incomplete = False
 
-    for kw in keywords[:max_keywords]:
+    for kw in list(dict.fromkeys(keywords))[:max_keywords]:
         if len(kw) < 3:
             continue
+        attempted += 1
+        observation = {"query": kw, "sort": "stars", "sample_limit": comparable_per_kw,
+                       "observed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+                       "sampled_count": None, "incomplete_results": None, "status": "unavailable"}
+        observations.append(observation)
         try:
             data = _search_repos(kw, token, provider, per_page=comparable_per_kw, sort="stars")
+            items, total, complete_flag, problems = _sample_data(data, comparable_per_kw)
         except GitHubAPIError as exc:
             errors.append(f"{kw}: {exc}")
             continue
-        for item in data.get("items") or []:
+        succeeded += 1
+        observation["sampled_count"] = len(items)
+        observation["pool_total"] = total
+        observation["incomplete_results"] = complete_flag
+        observation["status"] = "partial" if problems else "ok"
+        incomplete |= bool(problems)
+        if problems:
+            errors.append(f"{kw}: " + "; ".join(problems))
+        for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get("full_name"), str):
+                continue
             name = item.get("full_name") or ""
-            topics = item.get("topics") or []
-            comparables.append({"full_name": name, "stars": item.get("stargazers_count", 0),
-                                "topics": topics[:12]})
+            key = name.lower()
+            if not name or key == repo.lower() or item.get("fork") or item.get("archived") or key in comparables:
+                continue
+            topics = list(dict.fromkeys(t.lower() for t in (item.get("topics") or [])
+                                        if re.fullmatch(r"[a-z0-9-]{1,50}", t)))
+            comparables[key] = {"full_name": name, "stars": item.get("stargazers_count"),
+                                "topics": topics}
             for t in topics:
                 if t.lower() in exclude:
                     continue
                 cooccurrence[t] += 1
                 evidence.setdefault(t, []).append(name)
 
-    candidates = [
-        {"topic": t, "comparable_count": n, "examples": sorted(set(evidence[t]))[:4]}
-        for t, n in cooccurrence.most_common(12)
-        if n >= 2
-    ]
-    return {"candidates": candidates, "comparables_sampled": comparables, "errors": errors}
+    candidates = []
+    for t, n in sorted(cooccurrence.items(), key=lambda item: (-item[1], item[0])):
+        if n < 2:
+            continue
+        match_at = evidence_text.lower().find(t)
+        candidates.append({
+            "topic": t, "support_count": n, "comparable_count": n,
+            "sample_denominator": len(comparables), "examples": sorted(set(evidence[t]))[:4],
+            "requires_review": True, "lexical_support": match_at >= 0,
+            "evidence_snippet": evidence_text[max(0, match_at - 60):match_at + len(t) + 100] if match_at >= 0 else "",
+        })
+        if len(candidates) >= 12:
+            break
+    status = "unavailable" if attempted and not succeeded else "partial" if errors or incomplete else "ok"
+    return {"candidates": candidates, "comparables_sampled": list(comparables.values()),
+            "sample_denominator": None if attempted and not succeeded else len(comparables),
+            "errors": errors, "status": status,
+            "coverage": {"queries_attempted": attempted, "queries_succeeded": succeeded},
+            "observations": observations,
+            "note": "Co-occurrence and literal text matches are clues only; semantic relevance requires review."}
 
 
 def analyze_topics(repo: str, current_topics: list[str], our_stars: int,
                    keywords: list[str], token: str = "", provider: str = "auto",
-                   max_topics: int = 8, top_n: int = 15) -> dict:
-    """Full topic-competition report for a repo."""
+                   max_topics: int = 8, top_n: int = 15, evidence_text: str = "") -> dict:
+    """Topic structure and bounded Search API observations for a repo."""
+    if max_topics < 0 or not 1 <= top_n <= 100:
+        raise GitHubAPIError("Use max_topics >= 0 and top_n between 1 and 100.")
     report = {
         "repo": repo,
         "our_stars": our_stars,
@@ -227,6 +333,11 @@ def analyze_topics(repo: str, current_topics: list[str], our_stars: int,
         report["per_topic"].append(
             analyze_single_topic(topic, repo, our_stars, token, provider, top_n)
         )
+        entry = report["per_topic"][-1]
+        if entry.get("error"):
+            report["limitations"].append(f"{topic}: {entry['error']}")
+        if entry.get("incomplete_results") or entry.get("star_incomplete_results"):
+            report["limitations"].append(f"{topic}: GitHub returned incomplete search results.")
     if len(current_topics) > max_topics:
         report["limitations"].append(
             f"Analyzed first {max_topics} of {len(current_topics)} topics (raise with --max-topics)."
@@ -234,50 +345,69 @@ def analyze_topics(repo: str, current_topics: list[str], our_stars: int,
 
     exclude = {t.lower() for t in current_topics} | LANGUAGE_TOPICS
     try:
-        report["candidate_topics"] = discover_candidate_topics(keywords, exclude, token, provider)
+        report["candidate_topics"] = discover_candidate_topics(keywords, exclude, token, provider,
+                                                               repo=repo, evidence_text=evidence_text)
     except Exception as exc:  # noqa: BLE001 — candidate mining must never kill the report
-        report["limitations"].append(f"Candidate topic mining failed: {exc}")
+        report["candidate_topics"] = {"candidates": [], "status": "unavailable", "errors": [str(exc)]}
+    candidate_report = report["candidate_topics"]
+    report["limitations"].extend(f"Candidate topic mining: {error}" for error in candidate_report.get("errors", []))
+    if any(observation.get("incomplete_results") for observation in candidate_report.get("observations", [])):
+        report["limitations"].append("Candidate topic mining: GitHub returned incomplete search results.")
 
-    # split scores: quality (fully controllable) vs ranking (approximate, semi-controllable)
-    q_score, q_notes = quality_score(current_topics)
-    report["quality_score"] = q_score
-    report["quality_notes"] = q_notes
+    q_score, q_notes = structure_score(current_topics)
+    report["structure_score"] = report["quality_score"] = q_score  # old keys kept for CLI consumers
+    report["structure_notes"] = report["quality_notes"] = q_notes
     report["ranking_score"] = ranking_score(report["per_topic"])
+    succeeded = sum(e.get("status") in ("ok", "partial") for e in report["per_topic"])
+    report["coverage"] = {"topics_total": len(current_topics), "topics_analyzed": len(report["per_topic"]),
+                          "topics_succeeded": succeeded,
+                          "candidate_queries": candidate_report.get("coverage", {})}
+    statuses = [e.get("status", "unavailable") for e in report["per_topic"]]
+    if candidate_report.get("coverage", {}).get("queries_attempted") != 0:
+        statuses.append(candidate_report.get("status", "unavailable"))
+    if statuses and all(status == "unavailable" for status in statuses):
+        report["status"] = "unavailable"
+    elif all(status == "ok" for status in statuses) and len(report["per_topic"]) == len(current_topics):
+        report["status"] = "ok"
+    else:
+        report["status"] = "partial"
     return report
 
 
 def print_text(report: dict):
     """Human-readable summary for standalone CLI use."""
-    print(f"\nTopic Competition: {report['repo']} ({report['our_stars']}⭐)  "
-          f"quality={report.get('quality_score')} ranking={report.get('ranking_score')}")
+    print(f"\nTopic Structure / Search API Samples: {report['repo']} ({report['our_stars']}⭐)  "
+          f"structure={report.get('structure_score')} sample_score={report.get('ranking_score')} status={report['status']}")
     print("=" * 60)
-    for note in report.get("quality_notes", []):
-        print(f"  quality: {note}")
+    for note in report.get("structure_notes", []):
+        print(f"  structure: {note}")
     for e in report["per_topic"]:
-        rank = e["best_match_rank"] or "off-page"
+        rank = e["best_match_rank"] or "not observed"
         print(f"- {e['topic']}: rank≈{rank}, pool≈{e['pool_total']}, "
-              f"top20-median={e['median_stars_top20']}⭐  → {e['verdict']}")
+              f"star-sample-median={e['median_stars_sample']}⭐ (n={e['star_sampled_count']}) → {e['verdict']}")
         print(f"    {e['advice'] or e['error']}")
     cands = report.get("candidate_topics", {}).get("candidates", [])
     if cands:
-        print("\nCandidate topics (from comparable repos):")
+        print("\nCandidate topics (requires relevance review):")
         for c in cands[:8]:
-            print(f"- {c['topic']} (used by {c['comparable_count']} comparables, e.g. {', '.join(c['examples'][:2])})")
+            print(f"- {c['topic']} (used by {c['support_count']}/{c['sample_denominator']} unique sampled repos, e.g. {', '.join(c['examples'][:2])})")
     for lim in report["limitations"]:
         print(f"Limitation: {lim}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GitHub topic-page competition analysis.")
+    parser = argparse.ArgumentParser(description="Topic structure and GitHub Search API samples.")
     parser.add_argument("repo", help="owner/repo, GitHub URL, or local clone path")
     parser.add_argument("--token", help="GitHub token override (prefer GH_TOKEN env)")
     parser.add_argument("--provider", choices=["auto", "api", "gh"], default="auto")
     parser.add_argument("--max-topics", type=int, default=8)
-    parser.add_argument("--top-n", type=int, default=15, help="page window size (default 15)")
+    parser.add_argument("--top-n", type=int, default=15, help="Search API sample limit (1-100, default 15)")
     parser.add_argument("--keywords", default="", help="comma-separated keywords for candidate mining "
                                                        "(default: derived from repo name)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
+    if args.max_topics < 0 or not 1 <= args.top_n <= 100:
+        parser.error("--max-topics must be >= 0; --top-n must be between 1 and 100")
 
     try:
         repo = resolve_repo(args.repo)

@@ -21,9 +21,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 API_BASE = "https://api.github.com"
 USER_AGENT = "github-repo-seo-skill (+https://github.com/Royo-Qiao/github-repo-seo)"
+MAX_RETRY_WAIT = 60  # stop rather than retrying before a longer server-requested wait
 
 _TOKEN_CACHE: str | None = None
 _GH_AUTH_CACHE: dict | None = None
@@ -35,6 +38,7 @@ class GitHubAPIError(RuntimeError):
     def __init__(self, message: str, status: int | None = None, details: dict | None = None):
         super().__init__(message)
         self.status = status
+        self.status_code = status
         self.details = details or {}
 
 
@@ -147,19 +151,24 @@ def token_setup_hint() -> str:
 # ---------------------------------------------------------------------------
 
 def normalize_repo_slug(value: str) -> str:
-    """Normalize a repo identifier (URL, ssh, owner/repo) to owner/repo."""
+    """Accept only owner/repo or a GitHub repository URL/SSH remote."""
     if not value:
         return ""
     text = value.strip()
-    text = re.sub(r"\.git$", "", text)
     if text.startswith("git@github.com:"):
         text = text.split(":", 1)[1]
-    elif text.startswith(("https://github.com/", "http://github.com/", "www.github.com/")):
-        text = urllib.parse.urlparse(text).path.strip("/")
-    parts = [p for p in text.split("/") if p]
-    if len(parts) >= 2:
-        return f"{parts[0]}/{parts[1]}"
-    return ""
+    elif "://" in text or text.startswith("www.github.com/"):
+        url = urllib.parse.urlparse(text if "://" in text else "https://" + text)
+        if url.scheme not in ("http", "https", "ssh") or url.hostname not in ("github.com", "www.github.com"):
+            return ""
+        if url.scheme == "ssh" and url.username not in (None, "git"):
+            return ""
+        text = url.path.removeprefix("/").removesuffix("/")
+    text = re.sub(r"\.git$", "", text)
+    match = re.fullmatch(r"([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/([A-Za-z0-9_.-]+)", text)
+    if not match or match.group(2) in (".", ".."):
+        return ""
+    return f"{match.group(1)}/{match.group(2)}"
 
 
 def infer_repo_from_git(cwd: str = ".") -> str:
@@ -176,16 +185,18 @@ def infer_repo_from_git(cwd: str = ".") -> str:
 
 def resolve_repo(repo: str | None = None, cwd: str = ".") -> str:
     """Resolve slug from explicit value, or from git origin when given a local path."""
-    slug = normalize_repo_slug(repo or "")
-    if slug:
-        return slug
     if repo and os.path.isdir(repo):
         inferred = infer_repo_from_git(cwd=repo)
         if inferred:
             return inferred
-    inferred = infer_repo_from_git(cwd=cwd)
-    if inferred:
-        return inferred
+    elif repo:
+        slug = normalize_repo_slug(repo)
+        if slug:
+            return slug
+    else:
+        inferred = infer_repo_from_git(cwd=cwd)
+        if inferred:
+            return inferred
     raise GitHubAPIError(
         "Could not resolve repository. Pass owner/repo, a GitHub URL, "
         "or run inside a git repo with an origin remote."
@@ -311,24 +322,35 @@ def fetch_json(
         if status < 400:
             return json.loads(text) if text.strip() else {}
 
-        remaining = resp_headers.get("X-RateLimit-Remaining")
-        reset = resp_headers.get("X-RateLimit-Reset")
-        if attempt < retries and status in (429, 500, 502, 503, 504):
-            time.sleep(min(30, 2 ** attempt + 1))
-            attempt += 1
-            continue
-        if attempt < retries and status == 403 and remaining == "0" and reset:
-            try:
-                wait = max(1, min(30, int(reset) - int(time.time()) + 1))
-            except ValueError:
-                wait = 5
-            time.sleep(wait)
-            attempt += 1
-            continue
-
         try:
             detail = json.loads(text)
         except ValueError:
             detail = {"raw": text[:500]}
         message = detail.get("message", f"GitHub API error: HTTP {status}")
+        remaining = resp_headers.get("X-RateLimit-Remaining")
+        reset = resp_headers.get("X-RateLimit-Reset")
+        retry_after = resp_headers.get("Retry-After")
+        secondary = status == 403 and (retry_after is not None or "secondary rate limit" in message.lower())
+        retryable = status in (429, 500, 502, 503, 504) or secondary or (status == 403 and remaining == "0")
+        if attempt < retries and retryable:
+            wait = 60 if secondary else 2 ** attempt + 1
+            if retry_after is not None:
+                try:
+                    wait = max(0, float(retry_after))
+                except ValueError:
+                    try:
+                        retry_at = parsedate_to_datetime(retry_after)
+                        wait = max(0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+                    except (ValueError, TypeError, OverflowError):
+                        pass
+            elif remaining == "0" and reset:
+                try:
+                    wait = max(1, int(reset) - int(time.time()) + 1)
+                except ValueError:
+                    pass
+            if wait <= MAX_RETRY_WAIT:
+                time.sleep(wait)
+                attempt += 1
+                continue
+            detail["retry_after_seconds"] = wait
         raise GitHubAPIError(message, status=status, details=detail)

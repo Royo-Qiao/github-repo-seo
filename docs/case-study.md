@@ -1,42 +1,40 @@
-> Historical case study: rubric scores and submission status describe the recorded session, not verified current ranking, traffic growth or acceptance.
+# Historical case: Cloudflare-Edgetunnel
 
-# Case study: Cloudflare-Edgetunnel, 61 → 82 → 93
+Earlier case notes recorded audits of the author's
+[Royo-Qiao/Cloudflare-Edgetunnel](https://github.com/Royo-Qiao/Cloudflare-Edgetunnel),
+described there as a local web wizard for deploying nodes to Cloudflare Pages.
+The **61 → 82 → 93** progression below is a historical presentation-score record
+under the old rubric. It is not measured growth in views, clones, stars, search
+positions, or adoption, and cannot be compared directly with current readiness.
 
-This is the skill's first real-world run, applied to its own author's repo
-[Royo-Qiao/Cloudflare-Edgetunnel](https://github.com/Royo-Qiao/Cloudflare-Edgetunnel)
-(a local web wizard that deploys VLESS+WS+TLS nodes to Cloudflare Pages).
+## Recorded timeline
 
-All scores below come from `scripts/analyze.py`; they are directional
-heuristics, not official GitHub weights.
-
-## Timeline
-
-| Date | Score | What changed |
+| Date | Old score | Historical note |
 |---|---|---|
-| 2026-08-08 | **61** | Initial audit: thin README structure, incomplete community profile, unpolished topic set |
-| 2026-08-08 | **82** | First fix round driven by the report (PR [#1](https://github.com/Royo-Qiao/Cloudflare-Edgetunnel/pull/1)): badge row with alt text, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, LICENSE cleanup, contribution/acknowledgment/license sections in the README — merged as `f01ce0a` |
-| 2026-08-08 | — | Submitted to [zhuima/awesome-cloudflare](https://github.com/zhuima/awesome-cloudflare/pull/200) using the skill's awesome-list matching module |
-| 2026-09-28 | **93** | Second fix round after a `/code-review` pass: `SECURITY.md`, `NOTICE.md` with upstream attribution, corrected CoC version attribution — completing the community-profile trust signals |
+| 2026-08-08 | 61 | Initial notes described thin README structure, incomplete community files, and a topic set needing review. |
+| 2026-08-08 | 82 | Notes attributed the first revision to PR [#1](https://github.com/Royo-Qiao/Cloudflare-Edgetunnel/pull/1) and commit `f01ce0a`: badges/alt text, contribution and conduct files, license cleanup, and README community sections. |
+| 2026-08-08 | — | Notes recorded a proposed listing in [zhuima/awesome-cloudflare PR #200](https://github.com/zhuima/awesome-cloudflare/pull/200). This is a historical submission reference; its current state and acceptance are not verified here. |
+| 2026-09-28 | 93 | Notes attributed a later revision to `SECURITY.md`, upstream notices, and corrected conduct attribution. |
 
-## What the score components looked like (2026-09-28)
+These observations preserve the earlier case narrative. The linked repositories,
+commits, and PR statuses were not revalidated for this documentation update.
 
-- Metadata / trust files: community profile complete → the biggest single
-  recoverable block in the first audit
-- Topic quality: **100/100** — functional long-tail topics instead of
-  language-only tags
-- Topic ranking: deliberately ignored as a short-term lever (star-driven,
-  long-term signal — the report says so itself)
-- The report's "priority actions" section correctly identified trust files as
-  the highest gain-per-minute fix in both rounds
+## What the record demonstrates
 
-## Takeaways
+The old audit made repository presentation gaps concrete and supported reviewed
+edits. Its score increased when the old rubric's checks were satisfied. It did not
+show that community files, badges, or long-tail topics caused a ranking or traffic
+increase; its “gain per minute” estimates were score arithmetic, not growth data.
 
-1. **Community/trust files were the cheapest points** — GitHub's community
-   health checklist (LICENSE, CONTRIBUTING, CoC, SECURITY) is fully
-   controllable and worth a large chunk of the metadata weight.
-2. **The report's fix drafts are meant to be edited, not pasted** — the
-   README rewrites are keyword scaffolds; the natural-sounding copy around
-   them still needs a human (or Claude) pass.
-3. **Read-only reporting worked** — every fix was reviewed before being
-   committed, which caught real problems (e.g. a license claim that conflicted
-   with GPL-derived vendored code) that a blind auto-apply would have cemented.
+The useful practice is to review drafts against the real project. Existing case
+notes also recorded a license-attribution conflict, illustrating why factual and
+semantic review matters before applying changes. A generated scaffold alone is
+not a finished description, README, or submission.
+
+## How to measure a new case
+
+Use current readiness for presentation checks and separate it from outcome evidence.
+Save compatible JSON search observations for the same repository if comparison is
+wanted, and optionally archive permitted traffic snapshots. Record edits/publication
+dates and onboarding feedback. Report unknowns and competing explanations; do not
+sum overlapping traffic windows or turn score improvement into a growth claim.

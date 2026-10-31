@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import json
 import re
 import sys
@@ -31,16 +32,31 @@ BADGE_HOSTS = ("shields.io", "badgen.net", "badge.fury.io", "img.shields.io",
 def fetch_readme_from_repo(repo: str, token: str = "", provider: str = "auto") -> str:
     """Fetch README content for a repo via the contents API (base64-decoded)."""
     payload = fetch_json(f"/repos/{repo}/readme", token=token, provider=provider, timeout=30)
-    content = (payload or {}).get("content") or ""
-    if not content:
-        return ""
-    return base64.b64decode(content.encode("utf-8"), validate=False).decode("utf-8", errors="replace")
+    if (not isinstance(payload, dict) or payload.get("encoding") != "base64"
+            or payload.get("truncated") or not isinstance(payload.get("content"), str)):
+        raise GitHubAPIError("README response does not contain complete base64 content.")
+    try:
+        content = re.sub(r"\s", "", payload["content"])
+        return base64.b64decode(content, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeError, ValueError) as exc:
+        raise GitHubAPIError("README content could not be decoded.") from exc
 
 
 def strip_code_fences(text: str) -> str:
     """Remove fenced code blocks so their contents don't pollute text scans."""
-    text = re.sub(r"(?ms)^```[\s\S]*?^```[ \t]*$", "", text)
-    return re.sub(r"(?ms)^~~~[\s\S]*?^~~~[ \t]*$", "", text)
+    result, fence = [], None
+    for line in text.splitlines(keepends=True):
+        match = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if match and fence is None:
+            fence = match.group(1)
+            result.append("\n" if line.endswith("\n") else "")
+        elif fence is not None:
+            if re.match(r"^ {0,3}" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}\s*$", line):
+                fence = None
+            result.append("\n" if line.endswith("\n") else "")
+        else:
+            result.append(line)
+    return "".join(result)
 
 
 def extract_headings(markdown: str) -> list[dict]:
@@ -48,7 +64,9 @@ def extract_headings(markdown: str) -> list[dict]:
     headings = []
     lines = markdown.splitlines()
     for i, line in enumerate(lines, start=1):
-        m = re.match(r"^(#{1,6})\s+(.+?)\s*$", line.strip())
+        if line.startswith(("    ", "\t")):
+            continue
+        m = re.match(r"^ {0,3}(#{1,6})\s+(.+?)\s*$", line)
         if m:
             headings.append({"line": i, "level": len(m.group(1)), "text": m.group(2).strip()})
             continue
@@ -83,15 +101,22 @@ def extract_images(markdown: str) -> list[dict]:
     seen = {img["url"] for img in images}
     for m in re.finditer(r"<img\b[^>]*>", markdown):
         tag = m.group(0)
-        src = re.search(r'\bsrc="([^"]*)"', tag)
+        src = re.search(r'''\bsrc=["']([^"']*)["']''', tag)
         if not src:
             continue
         url = src.group(1).strip()
         if url in seen:
             continue
-        alt = re.search(r'\balt="([^"]*)"', tag)
+        alt = re.search(r'''\balt=["']([^"']*)["']''', tag)
         images.append({"alt": (alt.group(1) if alt else "").strip(), "url": url})
         seen.add(url)
+    definitions = dict(re.findall(r"(?m)^\s*\[([^\]]+)\]:\s*(\S+)", markdown))
+    for match in re.finditer(r"!\[([^\]]*)\]\[([^\]]*)\]", markdown):
+        label = match.group(2) or match.group(1)
+        url = definitions.get(label)
+        if url and url not in seen:
+            images.append({"alt": match.group(1), "url": url})
+            seen.add(url)
     return images
 
 
@@ -123,10 +148,11 @@ def detect_heading_jumps(headings: list[dict]) -> list[dict]:
 def add_finding(findings: list, category: str, severity: str, finding: str, evidence: str, fix: str):
     """Append one lint finding."""
     findings.append({"category": category, "severity": severity,
-                     "finding": finding, "evidence": evidence, "fix": fix})
+                     "finding": finding, "evidence": evidence, "fix": fix,
+                     "confidence": "Confirmed", "evidence_tier": "heuristic"})
 
 
-def score_report(markdown: str, intents: list[str] | None = None) -> dict:
+def score_report(markdown: str, intents: list[str] | None = None, project_type: str = "auto") -> dict:
     """Score README across 7 categories, total 100. Returns summary + findings."""
     intents = [t.lower() for t in (intents or [])]
     # extract headings from fence-stripped text so bash/python comments like
@@ -139,6 +165,11 @@ def score_report(markdown: str, intents: list[str] | None = None) -> dict:
     gifs = [img for img in content_images if img["url"].lower().split("?")[0].endswith(".gif")]
     words = plain_word_count(markdown)
     findings = []
+    if project_type == "auto":
+        low = markdown.lower()
+        project_type = ("skill" if "skill.md" in low else "list" if "curated list" in low or "精选" in low
+                        else "library" if "library" in low or "sdk" in low else "cli")
+    needs_commands = project_type not in ("list", "docs")
 
     # Opening clarity (20): what-is-it in the first lines + intent terms
     opening_score = 20
@@ -152,11 +183,12 @@ def score_report(markdown: str, intents: list[str] | None = None) -> dict:
                         "Opening lines contain none of the repo's functional keywords.",
                         f"Checked terms: {', '.join(intents[:8])}",
                         "State what the project IS and what problem it solves in the first 3-5 lines, using the words users search for.")
-    if len(opening_lines) < 2 or words < 200:
+    prose = [ln for ln in opening_lines if not ln.lstrip().startswith(("#", "![", "[![", "<img"))]
+    if not prose:
         opening_score -= 5
         add_finding(findings, "Opening Clarity", "Info",
                     "README opening is sparse.",
-                    f"Word count: {words}.",
+                    "No introductory prose in the opening lines.",
                     "Add a concise value-proposition paragraph under the title.")
     opening_score = max(0, opening_score)
 
@@ -168,13 +200,13 @@ def score_report(markdown: str, intents: list[str] | None = None) -> dict:
         ia_score -= 10
         add_finding(findings, "Information Architecture", "Warning",
                     "No H1 heading found.",
-                    "Google/GitHub extract the H1 as the page title.",
+                    "No level-one title in the README.",
                     "Start the README with a single `# Title`.")
     elif h1_count > 1:
         ia_score -= 8
         add_finding(findings, "Information Architecture", "Warning",
                     f"{h1_count} H1 headings detected — should be exactly one.",
-                    "Multiple H1s dilute the page title signal.",
+                    f"Observed {h1_count} level-one headings.",
                     "Demote extra H1s to H2.")
     if jumps:
         ia_score -= 5
@@ -190,34 +222,63 @@ def score_report(markdown: str, intents: list[str] | None = None) -> dict:
                        "setup", "usage", "快速开始", "安装", "使用")
     has_install = any(any(m in t for m in install_markers) for t in heading_text)
     code_blocks = count_code_blocks(markdown)
-    if not has_install:
+    # Only examples inside the documented getting-started sections satisfy this check.
+    quickstart_lines, active_level, in_fence = [], None, False
+    for line in markdown.splitlines():
+        if not in_fence:
+            heading = re.match(r"^ {0,3}(#{1,6})\s+(.+)$", line)
+            if heading:
+                level, title = len(heading.group(1)), heading.group(2).lower()
+                if any(marker in title for marker in install_markers):
+                    active_level = level
+                elif active_level is not None and level <= active_level:
+                    active_level = None
+        if active_level is not None:
+            quickstart_lines.append(line)
+        if line.strip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+    has_start_example = count_code_blocks("\n".join(quickstart_lines)) > 0
+    if needs_commands and not has_install:
         install_score -= 12
         add_finding(findings, "Install + Quickstart", "Critical",
                     "No installation/quickstart section heading.",
                     f"Headings: {', '.join(h['text'] for h in headings[:12]) or '(none)'}",
                     "Add `## Quickstart` (or 安装/快速开始) with copy-pasteable commands.")
-    if code_blocks == 0:
+    if needs_commands and (code_blocks == 0 or (has_install and not has_start_example)):
         install_score -= 8
         add_finding(findings, "Install + Quickstart", "Warning",
-                    "No code blocks detected.",
-                    "Zero fenced/indented code blocks.",
+                    "No command/example block in the getting-started section.",
+                    "The installation/usage sections contain no fenced or indented example.",
                     "Include runnable install + minimal usage commands in fenced blocks.")
     install_score = max(0, install_score)
 
     # Proof & visuals (15): screenshots / demo GIF
     proof_score = 15
-    if not content_images:
+    examples_present = any(any(m in t for m in ("example", "output", "demo", "示例", "输出", "演示"))
+                           for t in heading_text)
+    # A labeled output/example block can be useful without its own heading.
+    # Keep this structural only; the collector does not execute the example.
+    source_lines = markdown.splitlines()
+    prose_lines = strip_code_fences(markdown).splitlines()
+    for index, line in enumerate(prose_lines):
+        if line.startswith(("    ", "\t")):
+            continue
+        if re.search(r"\b(?:examples?|expected output|sample output)\b|示例|示范输出|预期输出", line, re.I):
+            if any(re.match(r"^ {0,3}(?:`{3,}|~{3,})", value)
+                   for value in source_lines[index + 1:index + 6]):
+                examples_present = True
+                break
+    if project_type == "ui" and not content_images:
         proof_score -= 9
         add_finding(findings, "Proof & Visuals", "Warning",
                     "No screenshots or demo images.",
                     "README has no content images (badges don't count).",
-                    "Add at least one screenshot or demo GIF showing the product in action — this strongly lifts conversion and rich-result eligibility.")
-    elif not gifs:
-        proof_score -= 4
-        add_finding(findings, "Proof & Visuals", "Info",
-                    "Static screenshots present but no demo GIF/video.",
-                    f"{len(content_images)} content image(s), 0 GIFs.",
-                    "A short demo GIF (or asciinema/YouTube embed) communicates value faster than text.")
+                    "Add a screenshot or demo link that shows the actual interface.")
+    elif needs_commands and not examples_present and not content_images:
+        proof_score -= 5
+        add_finding(findings, "Proof & Visuals", "Warning", "No usage example or expected output section.",
+                    "No example/output heading or labeled example block was found; commands have not been executed.",
+                    "Show a minimal input and expected output using the project's actual capabilities.")
     proof_markers = ("example", "screenshot", "demo", "output", "preview", "示例", "演示", "截图")
     if not any(any(m in t for m in proof_markers) for t in heading_text) and content_images:
         proof_score -= 2
@@ -230,8 +291,7 @@ def score_report(markdown: str, intents: list[str] | None = None) -> dict:
     # Badges (10): stars / CI / license coverage
     badge_score = 10
     if not badges:
-        badge_score -= 6
-        add_finding(findings, "Badges", "Warning",
+        add_finding(findings, "Badges", "Info",
                     "No status badges found.",
                     "No shields.io/badgen/workflow-badge images detected.",
                     "Add build-status + license badges at the top; they signal maintenance at a glance.")
@@ -240,13 +300,11 @@ def score_report(markdown: str, intents: list[str] | None = None) -> dict:
         has_ci = any(k in badge_blob for k in ("workflow", "actions", "ci", "build", "test"))
         has_license = "license" in badge_blob
         if not has_ci:
-            badge_score -= 2
             add_finding(findings, "Badges", "Info",
                         "No CI/build badge.",
                         f"Badge URLs: {', '.join(b['url'][:60] for b in badges[:5])}",
                         "Add a GitHub Actions workflow badge to show the build is green.")
         if not has_license:
-            badge_score -= 2
             add_finding(findings, "Badges", "Info",
                         "No license badge.",
                         "License is not surfaced in the badge row.",
@@ -274,7 +332,7 @@ def score_report(markdown: str, intents: list[str] | None = None) -> dict:
         add_finding(findings, "Readability", "Warning",
                     "Images missing alt text.",
                     f"{len(missing_alt)} content image(s) with empty alt.",
-                    "Describe each screenshot in its alt text — it's indexed by image search.")
+                    "Describe each image in alt text so readers using assistive tools can understand it.")
     if len(headings) < 4:
         read_score -= 3
         add_finding(findings, "Readability", "Info",
@@ -297,10 +355,15 @@ def score_report(markdown: str, intents: list[str] | None = None) -> dict:
               "Needs Improvement" if total >= 50 else "Poor" if total >= 30 else "Critical")
 
     return {
+        "status": "ok",
+        "project_type": project_type,
+        "coverage": {"structure": "ok", "command_execution": "not-run"},
+        "limitations": ["README lint checks documented structure; commands were not executed or proven correct."],
         "summary": {"score": total, "rating": rating},
         "category_scores": category_scores,
         "metrics": {
             "word_count": words,
+            "commands_executed": False,
             "heading_count": len(headings),
             "h1_count": h1_count,
             "code_block_count": code_blocks,
@@ -335,6 +398,7 @@ def main():
     parser.add_argument("--provider", choices=["auto", "api", "gh"], default="auto")
     parser.add_argument("--intent", action="append", default=[], help="Intent term (repeatable)")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--project-type", choices=["auto", "cli", "library", "ui", "dataset", "list", "skill", "docs"], default="auto")
     args = parser.parse_args()
 
     markdown, source = "", args.readme or args.repo or "(none)"
@@ -357,7 +421,7 @@ def main():
         print("Error: no README content (pass a file path or --repo).", file=sys.stderr)
         sys.exit(2)
 
-    report = {"source": source, "intents": args.intent, **score_report(markdown, args.intent)}
+    report = {"source": source, "intents": args.intent, **score_report(markdown, args.intent, args.project_type)}
     if args.json:
         print(json.dumps(report, indent=2, ensure_ascii=False))
     else:

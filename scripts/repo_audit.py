@@ -52,7 +52,7 @@ LANGUAGE_TOPICS = {
 
 def tokenize(text: str) -> list[str]:
     """Lowercase word tokens, minus stopwords and single chars."""
-    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    words = re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", (text or "").lower())
     return [w for w in words if len(w) > 1 and w not in STOP_WORDS]
 
 
@@ -75,6 +75,8 @@ def add_finding(findings: list, area: str, severity: str, finding: str, evidence
         "finding": finding,
         "evidence": evidence,
         "fix": fix,
+        "confidence": "Confirmed",
+        "evidence_tier": "heuristic",
     })
 
 
@@ -102,37 +104,49 @@ def build_audit(repo: str, token: str = "", provider: str = "auto") -> dict:
         "metadata": {},
         "community_profile": {},
         "findings": [],
+        "status": "ok",
+        "coverage": {"metadata": "unavailable", "community": "unavailable"},
     }
     findings = report["findings"]
     repo_data = {}
 
     try:
         repo_data = fetch_json(f"/repos/{repo}", token=token, provider=provider)
+        if not isinstance(repo_data, dict) or not isinstance(repo_data.get("name"), str) or not repo_data["name"]:
+            raise GitHubAPIError("Repository response has no valid repository identity.")
     except GitHubAPIError as exc:
         report["limitations"].append(f"Repository API unavailable: {exc}")
-        add_finding(findings, "Metadata", "Critical",
-                    "Repository could not be fetched from the GitHub API.",
-                    str(exc),
-                    "Check the owner/repo spelling, visibility (private?), and API auth.")
-        report["summary"] = score_findings(findings)
+        report["status"] = "unavailable"
+        report["summary"] = {"score": None, "rating": "Unknown", "critical": 0, "warning": 0}
         return report
+
+    report["coverage"]["metadata"] = "ok"
+    report["coverage"]["topics"] = "ok" if isinstance(repo_data.get("topics"), list) else "unavailable"
+    for key in ("description", "topics"):
+        if key not in repo_data or (key == "topics" and not isinstance(repo_data[key], list)):
+            report["status"] = "partial"
+            report["limitations"].append(f"Repository response did not provide {key}; absence is unknown.")
 
     community_data = {}
     try:
         community_data = fetch_json(f"/repos/{repo}/community/profile", token=token, provider=provider)
+        if not isinstance(community_data, dict) or not isinstance(community_data.get("files"), dict):
+            raise GitHubAPIError("Community profile response has no files observation.")
         report["community_profile"] = {
             "health_percentage": community_data.get("health_percentage"),
             "files": community_data.get("files") or {},
         }
+        report["coverage"]["community"] = "ok"
     except GitHubAPIError as exc:
         report["limitations"].append(f"Community profile API unavailable: {exc}")
+        report["status"] = "partial"
 
     md = {
         "name": repo_data.get("name") or "",
         "full_name": repo_data.get("full_name") or repo,
         "description": (repo_data.get("description") or "").strip(),
         "homepage": (repo_data.get("homepage") or "").strip(),
-        "topics": repo_data.get("topics") or [],
+        "topics": repo_data["topics"] if isinstance(repo_data.get("topics"), list) else [],
         "language": repo_data.get("language") or "",
         "archived": bool(repo_data.get("archived")),
         "fork": bool(repo_data.get("fork")),
@@ -145,7 +159,7 @@ def build_audit(repo: str, token: str = "", provider: str = "auto") -> dict:
         "default_branch": repo_data.get("default_branch") or "main",
         "license": (repo_data.get("license") or {}).get("spdx_id"),
         "has_pages": bool(repo_data.get("has_pages")),
-        "social_preview_url": repo_data.get("social_preview_url") or "",
+        "social_preview_url": repo_data.get("social_preview_url"),
     }
     report["metadata"] = md
 
@@ -156,17 +170,19 @@ def build_audit(repo: str, token: str = "", provider: str = "auto") -> dict:
     desc_tokens = [t for t in tokenize(description)]
     pushed_days = days_since(md["pushed_at"])
 
-    if not description:
+    if "description" not in repo_data:
+        pass
+    elif not description:
         add_finding(findings, "Metadata", "Critical",
                     "About description is missing.",
                     "GitHub metadata `description` is empty.",
                     "Add a one-line description containing what-it-does keywords (see suggested copy in the report).")
     else:
         if len(description) < 40:
-            add_finding(findings, "Metadata", "Warning",
-                        "Description is very short for search indexing.",
+            add_finding(findings, "Metadata", "Info",
+                        "Description is concise; review whether its meaning is clear.",
                         f"Description is {len(description)} characters.",
-                        "Aim for 60-140 characters covering function + audience + differentiator.")
+                        "Keep it concise; add context only if the function or intended users are unclear. Character count alone does not establish search quality.")
         functional = [t for t in desc_tokens if t not in name_tokens]
         if desc_tokens and not functional:
             add_finding(findings, "Metadata", "Warning",
@@ -175,11 +191,13 @@ def build_audit(repo: str, token: str = "", provider: str = "auto") -> dict:
                         "Rewrite so someone searching by *capability* (not brand) can match — include the problem solved and the category.")
         if len(description) > 350:
             add_finding(findings, "Metadata", "Info",
-                        "Description is longer than GitHub's About display width.",
-                        f"{len(description)} characters; About truncates around ~350.",
-                        "Keep the hook in the first ~120 characters.")
+                        "Description is lengthy; review readability in the About card.",
+                        f"Description is {len(description)} characters.",
+                        "Put the project's function first and check the actual About display.")
 
-    if not topics:
+    if report["coverage"]["topics"] != "ok":
+        pass
+    elif not topics:
         add_finding(findings, "Metadata", "Warning",
                     "No topics configured.",
                     "GitHub topics list is empty.",
@@ -214,7 +232,7 @@ def build_audit(repo: str, token: str = "", provider: str = "auto") -> dict:
                     "`homepage` is empty.",
                     "Point homepage at docs/demo site if one exists — it renders in the About card.")
 
-    if not md["social_preview_url"] and not md["has_pages"]:
+    if "social_preview_url" in repo_data and not md["social_preview_url"]:
         add_finding(findings, "Metadata", "Info",
                     "No custom social preview image.",
                     "`social_preview_url` is empty.",
@@ -224,13 +242,13 @@ def build_audit(repo: str, token: str = "", provider: str = "auto") -> dict:
         add_finding(findings, "Maintenance", "Critical",
                     "Repository is archived.",
                     "`archived=true` in metadata.",
-                    "Archived repos are deprioritized by users and rankers; unarchive if still maintained.")
+                    "State the maintenance status clearly; unarchive only if active development is resuming.")
 
     if pushed_days is not None and pushed_days > 365:
         add_finding(findings, "Maintenance", "Warning",
-                    "Repository looks abandoned.",
+                    "No pushes in more than a year; maintenance status needs review.",
                     f"Last push {pushed_days} days ago.",
-                    "Freshness is a trust signal; ship a docs/release update if the project is alive.")
+                    "Explain whether the project is stable, maintained, or discontinued; update docs if that status is unclear.")
     elif pushed_days is not None and pushed_days > 180:
         add_finding(findings, "Maintenance", "Info",
                     "No pushes in 6+ months.",
@@ -241,7 +259,7 @@ def build_audit(repo: str, token: str = "", provider: str = "auto") -> dict:
         add_finding(findings, "Trust", "Warning",
                     "No license detected.",
                     "`license` is null; many awesome-lists and adopters require one.",
-                    "Add a LICENSE file (MIT/Apache-2.0 are low-friction defaults).")
+                    "Document the project's actual license and retain upstream notices.")
 
     # ---------------- community profile checks ----------------
     if community_data:
@@ -252,8 +270,15 @@ def build_audit(repo: str, token: str = "", provider: str = "auto") -> dict:
                         f"GitHub community health: {health}%.",
                         "Complete missing governance files below.")
         files = community_data.get("files") or {}
-        for key in ("code_of_conduct", "contributing", "issue_template", "security_policy"):
+        for key in ("code_of_conduct", "contributing", "issue_template"):
             if not files.get(key):
+                if key == "issue_template":
+                    add_finding(findings, "Trust", "Info",
+                                "Issue template not identified by community profile.",
+                                "community/profile `files.issue_template` is null; directory-based templates were not inspected.",
+                                "Check `.github/ISSUE_TEMPLATE/` before treating a template as absent.")
+                    report["limitations"].append("Community profile alone does not establish absence of directory-based issue templates.")
+                    continue
                 sev = "Info" if key in ("issue_template", "security_policy") else "Warning"
                 add_finding(findings, "Trust", sev,
                             f"Missing community file: {key}.",
@@ -261,8 +286,11 @@ def build_audit(repo: str, token: str = "", provider: str = "auto") -> dict:
                             f"Add the `{key}` file (root or .github/).")
 
     report["summary"] = score_findings(findings)
+    if report["status"] != "ok":
+        report["summary"]["score"] = None
+        report["summary"]["rating"] = "Unknown"
     report["name_tokens"] = sorted(name_tokens)
-    report["description_tokens"] = sorted(set(desc_tokens))
+    report["description_tokens"] = list(dict.fromkeys(desc_tokens))
     return report
 
 

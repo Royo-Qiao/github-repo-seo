@@ -1,447 +1,398 @@
 #!/usr/bin/env python3
-"""
-github-repo-seo — full discoverability report for a GitHub repository.
-
-Orchestrates: metadata audit, README lint, in-site search position check,
-topic-page competition analysis, and awesome-list matching. Emits a markdown
-report (stdout) with scores, findings, and copy-pasteable fix suggestions.
-
-Standalone usage:
-  python analyze.py owner/repo
-  python analyze.py https://github.com/owner/repo --save report.md
-  python analyze.py /path/to/local/clone --json
-
-Auth: GH_TOKEN env > GITHUB_TOKEN env > `gh auth token`. No hardcoded tokens.
-"""
-
+"""Read-only repository readiness, search observations, and promotion drafts."""
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
-import time
 from datetime import datetime, timezone
+from pathlib import Path
 
-from github_api import (
-    GitHubAPIError,
-    auth_context,
-    fetch_json,
-    get_token,
-    resolve_repo,
-    token_setup_hint,
-)
+from github_api import GitHubAPIError, auth_context, get_token, resolve_repo
 from repo_audit import LANGUAGE_TOPICS, build_audit, tokenize
 from readme_lint import fetch_readme_from_repo, score_report
-from topic_competition import SEARCH_PAUSE, analyze_topics
+from topic_competition import analyze_topics, structure_score
 from awesome_match import find_awesome_lists
+from search_benchmark import benchmark_queries, compare_benchmarks
+from traffic_snapshot import collect_traffic
+from project_context import PROJECT_TYPES, collect_context, load_context, promotion_plan
+from local_audit import collect_local_evidence
 
-# metadata 25 / readme 30 / topic_quality 20 / topic_ranking 5 / ecosystem 20 = 100
-# topic_ranking is a star-driven, approximate long-term signal — kept at a
-# minimal weight on purpose (see render_markdown note).
-WEIGHTS = {"metadata": 0.25, "readme": 0.30, "topic_quality": 0.20,
-           "topic_ranking": 0.05, "ecosystem": 0.20}
+# Readiness rubric v2. Rankings, opportunities, and traffic are observations.
+WEIGHTS = {"metadata": 0.35, "readme": 0.40, "topic_structure": 0.25}
 
 
 def overall_rating(score: float) -> str:
-    """Map 0-100 to a rating label."""
     return ("Excellent" if score >= 90 else "Good" if score >= 70 else
             "Needs Improvement" if score >= 50 else "Poor" if score >= 30 else "Critical")
 
 
 def search_position(repo: str, queries: list[str], token: str, provider: str) -> list[dict]:
-    """Find the repo's rank in GitHub in-site search for a few key queries."""
-    results = []
-    for query in queries[:3]:
-        time.sleep(SEARCH_PAUSE)
-        try:
-            data = fetch_json("/search/repositories", token=token,
-                              params={"q": query, "per_page": 100}, provider=provider, timeout=35)
-            rank = next((i for i, item in enumerate(data.get("items") or [], 1)
-                         if (item.get("full_name") or "").lower() == repo.lower()), None)
-            results.append({"query": query, "total": data.get("total_count", 0),
-                            "rank_in_top100": rank})
-        except GitHubAPIError as exc:
-            results.append({"query": query, "total": None, "rank_in_top100": None, "error": str(exc)})
-    return results
+    """Compatibility wrapper; positions are API samples, not page rankings."""
+    return benchmark_queries(repo, queries, token, provider)
 
 
-def suggest_description(meta: dict, keywords: list[str]) -> str:
-    """Draft a keyword-rich About description (template; polish before use)."""
-    current = (meta.get("description") or "").strip()
-    lang = meta.get("language") or ""
-    functional = [k for k in keywords if k not in LANGUAGE_TOPICS][:4]
-    kw_phrase = " / ".join(functional) if functional else "[core-capability]"
-    if len(current) >= 60:
-        return current  # already decent; don't rewrite for the sake of it
-    parts = []
-    parts.append(f"[What it does: one verb phrase using {kw_phrase}].")
-    if lang:
-        parts.append(f"Built with {lang}.")
-    parts.append("[Who it is for + the problem it solves — the words a user would search for.]")
-    return " ".join(parts)
+def suggest_description(meta: dict, keywords: list[str], context: dict | None = None) -> str:
+    """Copy observed summary text; leave unsupported claims out."""
+    return ((context or {}).get("summary") or meta.get("description") or "").strip()
 
 
 def suggest_topics(current: list[str], topic_report: dict) -> tuple[list[str], list[str]]:
-    """Return (recommended topic list ≤15, notes) from verdicts + candidates."""
-    notes = []
-    keep, drop = [], []
-    for entry in topic_report.get("per_topic", []):
-        if entry["verdict"] in ("crowded-swap",):
-            drop.append(entry["topic"])
-        else:
-            keep.append(entry["topic"])
-    if drop:
-        notes.append(f"Dropped as too crowded: {', '.join(drop)}")
-    candidates = [c["topic"] for c in topic_report.get("candidate_topics", {}).get("candidates", [])]
-    recommended = []
-    for t in keep + candidates:
-        if t.lower() not in [r.lower() for r in recommended]:
-            recommended.append(t)
-        if len(recommended) >= 15:
-            break
+    """Preserve original valid topics; mined candidates require semantic review."""
+    kept, invalid = [], []
+    for topic in current:
+        if not isinstance(topic, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,49}", topic):
+            invalid.append(str(topic))
+            continue
+        if topic not in kept:
+            kept.append(topic)
+    notes = ["保留原有有效标签；拥挤、未分析或查询失败均不构成删除理由。"]
+    if invalid:
+        notes.append("语法不合规的标签待修正: " + ", ".join(invalid))
+    if len(kept) > 20:
+        notes.append("超过 GitHub 20 个标签上限；请按项目事实审核裁减。")
+    candidates = topic_report.get("candidate_topics", {}).get("candidates", [])
     if candidates:
-        notes.append(f"Added from comparable-repo co-occurrence: {', '.join(candidates[:6])}")
-    return recommended, notes
+        notes.append("共现候选待核实项目能力；未自动加入推荐列表。")
+    return kept[:20], notes
 
 
-def readme_opening_draft(meta: dict, keywords: list[str]) -> str:
-    """Scaffold for a discoverability-friendly README opening."""
+def readme_opening_draft(meta: dict, keywords: list[str], context: dict | None = None) -> str:
     name = meta.get("name") or "project"
-    functional = [k for k in keywords if k not in LANGUAGE_TOPICS][:3]
-    kw = ", ".join(functional) or "[core keywords]"
-    return (
-        f"# {name}\n\n"
-        f"> One sentence: what it is + the problem it solves (include: {kw}).\n\n"
-        "[badge row: build status | license | stars]\n\n"
-        "![demo](./docs/demo.gif)  <!-- a 10-20s GIF beats three paragraphs -->\n\n"
-        "## Why\n"
-        "[2-3 bullets: the pain point, how this solves it, what's different]\n\n"
-        "## Quickstart\n"
-        "```bash\n"
-        "# one copy-pasteable command that gets to a working result\n"
-        "```\n"
-    )
+    summary = suggest_description(meta, keywords, context)
+    return f"# {name}\n" + (f"\n{summary}\n" if summary else "")
 
 
-def build_report(repo: str, token: str, provider: str, max_topics: int, top_n: int) -> dict:
-    """Run every module and assemble the aggregate report dict."""
+def derive_queries(meta: dict, context: dict) -> list[str]:
+    """Evidence-derived starting points, explicitly adjustable by the user."""
+    words = tokenize(context.get("summary", ""))
+    queries = [" ".join(words[:3])] if words else []
+    queries += [f"topic:{t}" for t in meta.get("topics", []) if t not in LANGUAGE_TOPICS][:2]
+    name = meta.get("name", "").replace("-", " ").replace("_", " ")
+    if name:
+        queries.append(name)
+    return list(dict.fromkeys(q for q in queries if q.strip()))[:4]
+
+
+def skipped(reason: str, **fields) -> dict:
+    return {"status": "unavailable", "coverage": {}, "limitations": [reason], **fields}
+
+
+def build_report(repo: str, token: str, provider: str, max_topics: int, top_n: int,
+                 *, queries: list[str] | None = None, competitors: list[str] | None = None,
+                 context: dict | None = None, project_type: str = "auto",
+                 baseline: dict | None = None, traffic_dir: str | None = None,
+                 local_path: str | None = None, offline: bool = False) -> dict:
+    if offline and not local_path:
+        raise ValueError("Offline audit requires a local directory.")
+    if offline and (traffic_dir or baseline):
+        raise ValueError("Offline audits cannot collect traffic or compare remote search baselines.")
+    explicit_queries = queries or (context or {}).get("queries", [])
+    if not isinstance(explicit_queries, list) or any(not isinstance(q, str) for q in explicit_queries):
+        raise ValueError("Queries must be a list of strings.")
+    if len(set(q.strip() for q in explicit_queries if q.strip())) > 8:
+        raise ValueError("Use at most eight distinct benchmark queries.")
+    if baseline is not None:
+        if not isinstance(baseline, dict) or str(baseline.get("repo", "")).lower() != repo.lower():
+            raise ValueError("Baseline must be a JSON report for the same repository.")
+        if baseline.get("schema_version") != 2:
+            raise ValueError("Baseline uses a different report schema; generate a v2 JSON baseline first.")
+        rows = baseline.get("search_benchmark", [])
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError("Baseline search_benchmark must be a list of observations.")
     limitations = []
-    ctx = auth_context(token=token)
-
-    # 1. metadata audit
-    audit = build_audit(repo, token=token, provider=provider)
-    meta = audit["metadata"]
-    limitations += audit.get("limitations", [])
-
-    # 2. README lint (remote README; intents = repo's functional keywords)
-    keywords = sorted(set(audit.get("name_tokens", [])) | set(audit.get("description_tokens", []))
-                      | {t.lower() for t in (meta.get("topics") or []) if t.lower() not in LANGUAGE_TOPICS})
-    readme_report = {"summary": {"score": 0, "rating": "Unknown"}, "findings": [], "limitations": []}
-    try:
-        markdown = fetch_readme_from_repo(repo, token=token, provider=provider)
-        if markdown.strip():
-            readme_report = score_report(markdown, intents=keywords[:10])
+    local = collect_local_evidence(local_path, repo) if offline else None
+    audit = local["audit"] if local else build_audit(repo, token=token, provider=provider)
+    meta = audit.get("metadata", {})
+    metadata_observed = bool(meta) and not offline
+    markdown = ""
+    readme_report = skipped("README unavailable because repository metadata could not be fetched.",
+                            summary={"score": None, "rating": "Unknown"}, findings=[])
+    if local:
+        observation = local["files"]["readme"]
+        if observation["status"] != "unavailable":
+            markdown = local["markdown"] or ""
+            readme_report = score_report(markdown, project_type=project_type)
+            if not markdown.strip():
+                readme_report["summary"] = {"score": 0, "rating": "Critical"}
+                readme_report["limitations"].append("Local README was observed missing or empty.")
         else:
-            readme_report["limitations"].append("README is empty on the default branch.")
-    except GitHubAPIError as exc:
-        readme_report["limitations"].append(f"README fetch failed: {exc}")
-    limitations += readme_report.get("limitations", [])
-
-    # 3. topic competition
-    topic_report = analyze_topics(
-        repo=repo, current_topics=meta.get("topics") or [],
-        our_stars=int(meta.get("stargazers_count", 0)),
-        keywords=[k for k in keywords if k not in LANGUAGE_TOPICS][:4],
-        token=token, provider=provider, max_topics=max_topics, top_n=top_n,
-    )
-    limitations += topic_report.get("limitations", [])
-
-    # 4. in-site search position for a couple of key queries
-    name_phrase = (meta.get("name") or "").replace("-", " ").replace("_", " ")
-    queries = [q for q in [name_phrase, " ".join(keywords[:2])] if q.strip()][:2]
-    bench = search_position(repo, queries, token, provider) if queries else []
-
-    # 5. awesome-list matching
-    awesome_report = find_awesome_lists(
-        repo=repo, topics=meta.get("topics") or [], language=meta.get("language") or "",
-        name=meta.get("name") or "", description=meta.get("description") or "",
-        token=token, provider=provider,
-    )
-
-    # aggregate score
-    eco = min(100, awesome_report["score"] + (10 if meta.get("homepage") else 0))
-    scores = {
-        "metadata": audit["summary"]["score"],
-        "readme": readme_report["summary"]["score"],
-        "topic_quality": topic_report.get("quality_score", 0),
-        "topic_ranking": topic_report.get("ranking_score", 0),
-        "ecosystem": eco,
-    }
-    overall = round(sum(scores[k] * WEIGHTS[k] for k in WEIGHTS))
-
-    # copy-paste suggestions
-    rec_topics, topic_notes = suggest_topics(meta, topic_report)
-    suggestions = {
-        "description": suggest_description(meta, keywords),
-        "topics": rec_topics,
-        "topic_notes": topic_notes,
-        "readme_opening": readme_opening_draft(meta, keywords),
-    }
-
-    return {
-        "generated_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
-        "repo": repo,
-        "auth_context": ctx,
-        "overall": {"score": overall, "rating": overall_rating(overall), "weights": WEIGHTS},
-        "module_scores": scores,
-        "metadata": meta,
-        "audit": audit,
-        "readme": readme_report,
-        "topics": topic_report,
-        "search_benchmark": bench,
-        "awesome": awesome_report,
-        "suggestions": suggestions,
-        "limitations": limitations,
-    }
-
-
-def priority_actions(r: dict) -> list[dict]:
-    """Derive ≤3 actions sorted by impact-per-minute (gain in overall points / effort)."""
-    actions = []
-    ms = r["module_scores"]
-
-    # 1. Topics: biggest controllable lever when quality is low
-    tq = ms["topic_quality"]
-    if tq < 80:
-        gain = round((85 - tq) * WEIGHTS["topic_quality"])
-        actions.append({
-            "text": "补齐/调整 Topics 为 5-15 个精准功能词(直接把第六节推荐列表粘贴到 About → Topics)",
-            "gain": gain, "minutes": 5,
-        })
-
-    # 2. Trust files: each Warning costs the metadata score 8 points
-    trust = [f for f in r["audit"].get("findings", [])
-             if f.get("area") == "Trust" and f.get("severity") in ("Critical", "Warning")]
-    if trust:
-        recoverable = min(len(trust) * 8, max(0, 100 - ms["metadata"]))
-        gain = round(recoverable * WEIGHTS["metadata"])
-        names = sorted({
-            f["finding"].split(":")[-1].strip(" .")
-            for f in trust if f["finding"].startswith("Missing community file")
-        })
-        label = ", ".join(names) if names else "社区治理文件"
-        actions.append({
-            "text": f"补齐信任文件({label})— 可用 GitHub 社区模板在网页端一键生成",
-            "gain": gain, "minutes": 10 * len(trust),
-        })
-
-    # 3. README category fixes → readme score points × readme weight
-    readme_fixes = {
-        "Opening Clarity": ("按第六节示例改写 README 首段", 10, 15),
-        "Install + Quickstart": ("README 增加 Quickstart 安装命令区", 12, 15),
-        "Proof & Visuals": ("README 增加截图或演示 GIF", 9, 30),
-        "Badges": ("README 顶部增加 badges(CI/license/stars,shields.io)", 6, 10),
-        "CTA + Community": ("README 增加 Contributing / issue 反馈入口", 6, 10),
-    }
-    seen = set()
-    for f in r["readme"].get("findings", []):
-        cat = f.get("category")
-        if cat in readme_fixes and cat not in seen and f.get("severity") in ("Critical", "Warning"):
-            label, pts, mins = readme_fixes[cat]
-            actions.append({"text": label, "gain": round(pts * WEIGHTS["readme"], 1), "minutes": mins})
-            seen.add(cat)
-
-    actions.sort(key=lambda a: a["gain"] / a["minutes"], reverse=True)
-    return actions[:3]
+            readme_report = skipped("Local README could not be read: " + observation["reason"],
+                                    summary={"score": None, "rating": "Unknown"}, findings=[])
+    elif metadata_observed:
+        try:
+            markdown = fetch_readme_from_repo(repo, token=token, provider=provider)
+            # A successful empty response confirms empty content. HTTP errors do not.
+            readme_report = score_report(markdown, project_type=project_type)
+            if not markdown.strip():
+                readme_report["summary"] = {"score": 0, "rating": "Critical"}
+                readme_report["limitations"].append("README content was observed to be empty.")
+        except GitHubAPIError as exc:
+            readme_report = skipped(f"README fetch failed: {exc}", summary={"score": None, "rating": "Unknown"}, findings=[])
+    draft_meta = dict(meta, full_name="" if offline else repo, name=meta.get("name") or repo.split("/")[-1])
+    project = collect_context(draft_meta, markdown, context, local_path, project_type)
+    keywords = list(dict.fromkeys(tokenize(project["summary"]) +
+                                  [t for t in meta.get("topics", []) if t not in LANGUAGE_TOPICS]))
+    if readme_report.get("status") == "ok" and markdown.strip():
+        readme_report = score_report(markdown, intents=keywords[:10], project_type=project["project_type"])
+    if local:
+        readme_report["source"] = {"kind": "local-file", "path": local["files"]["readme"]["path"]}
+    topics_observed = metadata_observed and audit.get("coverage", {}).get("topics", "ok") == "ok"
+    q_score, q_notes = structure_score(meta.get("topics", [])) if topics_observed else (None, [])
+    reason = ("Offline audit: GitHub metadata, topics, search, and list checks were not requested." if offline else
+              "Repository metadata unavailable; search modules were not run." if not metadata_observed else
+              "No token: basic metadata/README checks only; authenticate to enable Search API modules.")
+    if metadata_observed and token:
+        topics = analyze_topics(repo, meta.get("topics", []), int(meta.get("stargazers_count", 0)),
+                                keywords[:4], token=token, provider=provider, max_topics=max_topics,
+                                top_n=top_n, evidence_text=markdown + "\n" + project["summary"])
+        awesome = find_awesome_lists(repo=repo, topics=meta.get("topics", []), language=meta.get("language", ""),
+                                     name=meta.get("name", ""), description=meta.get("description", ""), token=token, provider=provider)
+    else:
+        topics = skipped(reason, per_topic=[], candidate_topics={"candidates": []}, ranking_score=None,
+                         structure_score=q_score, structure_notes=q_notes, our_stars=meta.get("stargazers_count"))
+        awesome = skipped(reason, lists=[], terms_used=[], total_matches=None, score=None)
+    selected_queries = list(dict.fromkeys(q.strip() for q in (queries or project["queries"] or derive_queries(meta, project)) if q.strip()))
+    if len(selected_queries) > 8:
+        raise ValueError("Use at most eight distinct benchmark queries.")
+    bench = benchmark_queries(repo, selected_queries, token, provider, competitors=competitors) if metadata_observed and token else []
+    for row in bench:
+        if row.get("error"):
+            limitations.append(f"Search query {row['query']}: {row['error']}")
+    comparison = None
+    if baseline is not None:
+        if not isinstance(baseline, dict) or str(baseline.get("repo", "")).lower() != repo.lower():
+            raise ValueError("Baseline must be a JSON report for the same repository.")
+        if baseline.get("schema_version") != 2:
+            raise ValueError("Baseline uses a different report schema; generate a v2 JSON baseline first.")
+        comparison = compare_benchmarks(bench, baseline.get("search_benchmark", []))
+        limitations.extend(comparison["limitations"])
+    traffic = collect_traffic(repo, token, provider, archive_dir=traffic_dir) if traffic_dir else None
+    scores = {"metadata": audit.get("summary", {}).get("score"),
+              "readme": readme_report.get("summary", {}).get("score"), "topic_structure": q_score}
+    evaluated_weight = sum(WEIGHTS[k] for k, score in scores.items() if score is not None)
+    total = round(sum(scores[k] * WEIGHTS[k] for k in WEIGHTS)) if all(v is not None for v in scores.values()) else None
+    recommended, notes = suggest_topics(meta.get("topics", []), topics)
+    for module in (audit, readme_report, topics, awesome, traffic or {}):
+        limitations.extend(module.get("limitations", []))
+    limitations.extend(project["limitations"])
+    return {"schema_version": 2, "rubric_version": "readiness-v2", "repo": repo,
+            "generated_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+            "input_source": "local-offline" if offline else "github-api",
+            "local_evidence": {"files": local["files"]} if local else None,
+            "auth_context": {"mode": "offline", "token_present": False, "gh_available": None, "gh_authenticated": None} if offline else auth_context(token=token), "overall": {"score": total,
+                "rating": overall_rating(total) if total is not None else "Unknown", "weights": WEIGHTS,
+                "evaluated_weight": round(evaluated_weight, 3), "status": "ok" if total is not None else "partial"},
+            "module_scores": scores, "metadata": meta, "audit": audit, "readme": readme_report,
+            "project_context": project, "topics": topics, "search_benchmark": bench,
+            "benchmark_queries": selected_queries, "query_source": "provided" if queries or project["queries"] else "heuristic",
+            "comparison": comparison, "awesome": awesome, "traffic": traffic,
+            "suggestions": {"description": suggest_description(draft_meta, keywords, project), "topics": recommended,
+                            "topic_notes": notes, "readme_opening": readme_opening_draft(draft_meta, keywords, project)},
+            "promotion": promotion_plan(draft_meta, project), "limitations": list(dict.fromkeys(limitations))}
 
 
-def render_markdown(r: dict) -> str:
-    """Render the aggregate report as markdown."""
-    md = r["metadata"]
-    o = r["overall"]
-    out = []
-    out.append(f"# GitHub 可发现性分析报告 — {r['repo']}\n")
-    out.append(f"> 生成时间: {r['generated_at_utc']} | 认证方式: {r['auth_context']['mode']} | "
-               f"分析脚本: github-repo-seo skill\n")
+def priority_actions(report: dict) -> list[dict]:
+    """Prioritize observed gaps; do not predict score or traffic increases."""
+    actions, seen = [], set()
+    for module in (report["readme"], report["audit"]):
+        if module.get("status") == "unavailable":
+            continue
+        for finding in module.get("findings", []):
+            if finding.get("severity") not in ("Critical", "Warning"):
+                continue
+            category = finding.get("category") or finding.get("area")
+            if category in seen:
+                continue
+            seen.add(category)
+            actions.append({"text": finding["fix"], "evidence": finding["evidence"],
+                            "severity": finding["severity"], "confidence": finding.get("confidence", "Confirmed")})
+    return sorted(actions, key=lambda a: 0 if a["severity"] == "Critical" else 1)[:5]
 
-    ms = r["module_scores"]
-    acts = priority_actions(r)
-    if acts:
-        out.append("## 零、优先行动清单(按性价比排序:预计提分 ÷ 耗时)\n")
-        for i, a in enumerate(acts, 1):
-            out.append(f"{i}. **{a['text']}** — 预计总分 **+{a['gain']} 分**,约 {a['minutes']} 分钟")
+
+def cell(value) -> str:
+    return "未知" if value is None else str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def render_markdown(report: dict) -> str:
+    overall = report["overall"]
+    out = [f"# GitHub 可发现性与推广报告 — {report['repo']}", "",
+           f"> 生成时间: {report['generated_at_utc']} | 评分口径: readiness-v2", "",
+           "## 资料完整度", ""]
+    if report.get("input_source") == "local-offline":
+        out += ["本报告只检查本地文件；未联网、未读取凭据，GitHub About、Topics、搜索与流量均未知。", "",
+                "| 本地材料 | 状态 | 相对路径 |", "|---|---|---|"]
+        for key, observation in report["local_evidence"]["files"].items():
+            out.append(f"| {key} | {observation['status']} | {cell(observation['path'])} |")
         out.append("")
-
-    out.append("## 一、总体评分\n")
-    out.append(f"**{o['score']}/100 — {o['rating']}**\n")
-    out.append("| 模块 | 得分 | 权重 | 说明 |")
-    out.append("|---|---|---|---|")
-    out.append(f"| 元数据(名称/About/Topics) | {ms['metadata']} | 25% | 仓库 About 区与标签质量 |")
-    out.append(f"| README 结构 | {ms['readme']} | 30% | 首屏清晰度/安装/截图/badges |")
-    out.append(f"| Topic 质量(覆盖度/精准度) | {ms['topic_quality']} | 20% | 完全可控:有无 topics、数量、功能词 |")
-    out.append(f"| Topic 预估排名 | {ms['topic_ranking']} | 5% | 半可控 + API 近似值,仅作参考 |")
-    out.append(f"| 生态收录机会 | {ms['ecosystem']} | 20% | awesome-list 候选 + homepage |")
-    out.append("")
-
-    if md:
-        license_label = md.get("license") or "—"
-        if license_label == "NOASSERTION":
-            license_label = "NOASSERTION(有 LICENSE 文件但非标准 SPDX,建议换用常见许可证)"
-        out.append("## 二、现状速览\n")
-        out.append(f"- ⭐ {md.get('stargazers_count')} stars / 🍴 {md.get('forks_count')} forks / "
-                   f"👀 {md.get('watchers_count')} watchers")
-        out.append(f"- 语言: {md.get('language') or '—'} | 许可: {license_label} | "
-                   f"默认分支: `{md.get('default_branch')}`")
-        out.append(f"- 最近推送: {md.get('pushed_at')} | Homepage: {md.get('homepage') or '—'}")
-        out.append(f"- 当前描述: {md.get('description') or '(空)'}")
-        out.append(f"- 当前 Topics({len(md.get('topics') or [])}): {', '.join(md.get('topics') or []) or '(空)'}")
-        bench = r["search_benchmark"]
-        if bench:
-            out.append("- GitHub 站内搜索位置:")
-            for b in bench:
-                rank = b.get("rank_in_top100")
-                rank_txt = f"第 {rank} 名" if rank else "前 100 名外"
-                err = f"(出错: {b['error']})" if b.get("error") else ""
-                out.append(f"  - 关键词 `{b['query']}`: {rank_txt} / 共 {b.get('total')} 个结果 {err}")
-        out.append("")
-
-    out.append("## 三、问题清单(按严重度)\n")
-    all_findings = []
-    all_findings += [dict(f, module="元数据") for f in r["audit"].get("findings", [])]
-    all_findings += [dict(f, module="README", area=f.get("category", "")) for f in r["readme"].get("findings", [])]
-    order = {"Critical": 0, "Warning": 1, "Info": 2, "Pass": 3}
-    all_findings = [f for f in all_findings if f.get("severity") in ("Critical", "Warning", "Info")]
-    all_findings.sort(key=lambda f: order.get(f["severity"], 9))
-    if not all_findings:
-        out.append("✅ 未发现明显问题。\n")
-    for f in all_findings:
-        out.append(f"- **[{f['severity']}]** ({f['module']}/{f.get('area','')}) {f['finding']}")
-        out.append(f"  - 依据: {f.get('evidence','')}")
-        out.append(f"  - 修复: {f.get('fix','')}")
-    out.append("")
-
-    out.append("## 四、Topic 竞争度分析\n")
-    out.append(f"**Topic 质量分: {ms['topic_quality']}/100**(计入总分,权重 20%)")
-    for note in r["topics"].get("quality_notes", []):
-        out.append(f"- {note}")
-    out.append("")
-    out.append(f"**Topic 预估排名分: {ms['topic_ranking']}/100**(计入总分,权重仅 5%)\n")
-    out.append("> ⚠️ 预估排名是**长期指标**:与 star 数、活跃度强相关,且排名本身是 GitHub Search API"
-               "(`topic:<name>` 默认 best-match 排序)对 topics 页面排序的近似。"
-               "**不建议作为短期行动依据** — 短期提分请看「零、优先行动清单」和 Topic 质量分;"
-               "排名会随 stars 增长自然改善。⭐对比取自 star 排序前 20 名的中位数。\n")
-    per = r["topics"].get("per_topic", [])
-    if per:
-        out.append("| Topic | 页面内排名 | 收录仓库总数 | Top20 中位⭐ | 你的⭐ | 判定 | 建议 |")
-        out.append("|---|---|---|---|---|---|---|")
-        verdict_cn = {"keep-strong": "🟢 强势守住", "keep": "🟢 可见", "niche-opportunity": "🔵 冷门蓝海",
-                      "crowded-swap": "🔴 过卷建议换", "off-page": "🟠 页面外", "error": "⚠️ 查询失败",
-                      "unknown": "—"}
-        for e in per:
-            rank = f"≈#{e['best_match_rank']}" if e["best_match_rank"] else "前{}外".format("N")
-            out.append(f"| `{e['topic']}` | {rank} | {e['pool_total']} | "
-                       f"{e['median_stars_top20'] if e['median_stars_top20'] is not None else '—'} | "
-                       f"{r['topics']['our_stars']} | {verdict_cn.get(e['verdict'], e['verdict'])} | {e['advice'] or e['error']} |")
-        out.append("")
-        leaders = per[0].get("top_repos", [])[:5] if per else []
-        if leaders:
-            out.append(f"`{per[0]['topic']}` best-match 前 5 名示例:")
-            for row in leaders:
-                out.append(f"  - {row['full_name']} ({row['stars']}⭐)")
-            out.append("")
-    cands = r["topics"].get("candidate_topics", {}).get("candidates", [])
-    if cands:
-        out.append("**值得新增的候选 topic**(来自可比仓库的共现统计):")
-        for c in cands[:8]:
-            out.append(f"  - `{c['topic']}` — 被 {c['comparable_count']} 个可比仓库使用,如 {', '.join(c['examples'][:2])}")
-        out.append("")
-
-    out.append("## 五、Awesome-list 收录机会\n")
-    awesome = r["awesome"]
-    out.append(f"检索词: {', '.join(awesome.get('terms_used', []))} | 命中 {awesome.get('total_matches', 0)} 个(展示前 5)\n")
-    if not awesome.get("lists"):
-        out.append("未找到仍在维护且规模达标的 awesome-list。可尝试更换检索词,或考虑领域内非 awesome 命名的清单。\n")
-    for entry in awesome.get("lists", []):
-        out.append(f"- **[{entry['full_name']}]({entry['url']})** — {entry['stars']}⭐,"
-                   f"最近推送 {entry['days_since_push']} 天前,匹配词: {', '.join(entry['matched_terms'])}")
-        if entry.get("contributing_url"):
-            out.append(f"  - 📖 贡献指南: {entry['contributing_url']}")
-        elif entry.get("note"):
-            out.append(f"  - ℹ️ {entry['note']}")
-        if entry.get("description"):
-            out.append(f"  - {entry['description']}")
-    out.append("")
-
-    s = r["suggestions"]
-    out.append("## 六、可直接复制的修改文案\n")
-    out.append("### 1) About 描述(GitHub 仓库页 → About → 编辑)\n")
-    out.append("```")
-    out.append(s["description"])
-    out.append("```\n")
-    out.append("### 2) Topics 建议列表(逗号分隔,直接粘贴)\n")
-    out.append("```")
-    out.append(", ".join(s["topics"]) if s["topics"] else "(暂无可推荐)")
-    out.append("```")
-    for note in s["topic_notes"]:
-        out.append(f"- {note}")
-    out.append("")
-    out.append("### 3) README 首屏改写示例\n")
-    out.append("```markdown")
-    out.append(s["readme_opening"].rstrip())
-    out.append("```\n")
-
-    if r["limitations"]:
-        out.append("## 限制与说明\n")
-        for lim in r["limitations"][:12]:
-            out.append(f"- {lim}")
-        out.append("")
-    out.append("---")
-    out.append("*评分为方向性启发式,非 GitHub 官方排名权重。方法论与部分检查项改编自 "
-               "[Bhanunamikaze/Agentic-SEO-Skill](https://github.com/Bhanunamikaze/Agentic-SEO-Skill)(MIT),"
-               "topic 共现方法参考 [agentic-devrel/github-topic-recommender](https://github.com/agentic-devrel/github-topic-recommender)。*")
+    if overall["score"] is None:
+        out.append(f"**未完整评估**；已评估权重 {overall['evaluated_weight']:.0%}，未知项未计为零分。")
+    else:
+        out.append(f"**{overall['score']}/100 — {overall['rating']}**（自定义结构与资料启发式，不是排名或增长指标）")
+    out += ["", "| 模块 | 得分 | 权重 |", "|---|---|---|"]
+    names = {"metadata": "元数据与社区资料", "readme": "README 结构", "topic_structure": "Topics 语法与结构覆盖"}
+    for key, weight in WEIGHTS.items():
+        out.append(f"| {names[key]} | {cell(report['module_scores'][key])} | {weight:.0%} |")
+    out += ["", "搜索样本、投稿机会、流量均单独展示；与旧版总分不可直接比较。", "", "## 优先行动", ""]
+    actions = priority_actions(report)
+    for index, action in enumerate(actions, 1):
+        out += [f"{index}. {action['text']}", f"   依据: {action['evidence']}；事实置信度: {action['confidence']}。"]
+    if not actions:
+        out.append("现有可获取数据未产生优先修复项；请同时查看数据限制。")
+    context = report["project_context"]
+    out += ["", "## 项目定位与文案", "", f"- 类型: {context['project_type']}（{context['project_type_source']}）",
+            f"- 简介来源: {context['summary_source']}"]
+    for key in ("audience", "problem", "differentiator", "goal"):
+        if context.get(key):
+            out.append(f"- {key}: {context[key]}（用户提供）")
+    for fact in context.get("facts", []):
+        out.append(f"- 仓库依据: {fact['text']} — `{fact['source']}`；命令未执行。")
+    out += ["", "### About 草稿", "", "````text", report["suggestions"]["description"] or "暂无足够事实生成简介。", "````",
+            "", "### README 首屏草稿", "", "````markdown", report["suggestions"]["readme_opening"].rstrip(), "````",
+            "", "## 观察到的问题", ""]
+    findings = report["audit"].get("findings", []) + report["readme"].get("findings", [])
+    for finding in findings:
+        out += [f"- **{finding['severity']}** {finding['finding']}", f"  - 依据: {finding['evidence']}",
+                f"  - 建议: {finding['fix']}",
+                f"  - 事实: {finding.get('confidence', 'Confirmed')}；效果证据: {finding.get('evidence_tier', 'heuristic')}。"]
+    if not findings:
+        out.append("没有已确认的问题；不可获取的模块见限制。")
+    out += ["", "## Topics 保留与候选审核", "", ", ".join(report["suggestions"]["topics"]) or "未观察到原有标签。"]
+    out += [f"- {note}" for note in report["suggestions"]["topic_notes"]]
+    for note in report["topics"].get("structure_notes", []):
+        out.append(f"- 结构检查: {note}")
+    candidates = report["topics"].get("candidate_topics", {}).get("candidates", [])
+    for candidate in candidates:
+        out.append(f"- 待审核 `{candidate['topic']}`: {candidate.get('support_count', candidate.get('comparable_count'))}/"
+                   f"{candidate.get('sample_denominator', '未知')} 个独立样本；字面线索: {candidate.get('evidence_snippet') or '未观察到'}；"
+                   f"来源: {', '.join(candidate.get('examples', []))}。")
+    per_topic = report["topics"].get("per_topic", [])
+    if per_topic:
+        out += ["", "| Topic | API 样本位置 | 样本数/上限 | Stars 样本中位数 | Stars 样本数 | 状态 |",
+                "|---|---|---|---|---|---|"]
+        for row in per_topic:
+            rank = row.get("best_match_rank")
+            position = f"#{rank}" if rank is not None else "未知" if row.get("status") == "unavailable" else "未进入样本"
+            out.append(f"| {cell(row['topic'])} | {position} | {cell(row.get('sampled_count'))}/{cell(row.get('sample_limit'))} | "
+                       f"{cell(row.get('median_stars_sample'))} | {cell(row.get('star_sampled_count'))} | {row.get('status')} |")
+        out.append("\n这些是 Search API best-match 查询观察，与 Topics 页面实际排序分开；不据此预测流量。")
+    out += ["", "## 目标查询基准", "", f"查询来源: {report['query_source']}；可用 --query 明确目标词。",
+            "", "| 查询 | 样本位置 | 返回数/上限 | 完整性 | 时间 UTC |", "|---|---|---|---|---|"]
+    for row in report["search_benchmark"]:
+        rank = row.get("rank_in_sample")
+        position = f"#{rank}" if rank is not None else "未知" if row["status"] == "unavailable" else "未进入样本"
+        out.append(f"| {cell(row['query'])} | {position} | {cell(row.get('sampled_count'))}/{row['sample_limit']} | "
+                   f"{row['status']} | {row['observed_at_utc']} |")
+        for competitor in row.get("competitors", []):
+            out.append(f"\n明确指定的竞品: {competitor['full_name']}，同查询样本 #{competitor['rank_in_sample']}。")
+    if not report["search_benchmark"]:
+        out.append("\n查询数据未采集。")
+    if report.get("comparison"):
+        out += ["", "### 与基线比较", ""]
+        for comparison in report["comparison"]["comparisons"]:
+            out.append(f"- {comparison['query']}: {comparison['change']}；位置变化 {cell(comparison['rank_delta'])}；"
+                       f"{comparison.get('reason') or '同口径观察；变化不证明优化因果'}。")
+    out += ["", "## Awesome-list 投稿机会", "", f"采集状态: {report['awesome'].get('status')}；机会不计入资料分。"]
+    for entry in report["awesome"].get("lists", []):
+        out += ["", f"### [{entry['full_name']}]({entry['url']})", "", f"状态: {entry['status']}；已收录: {cell(entry['already_listed'])}。"]
+        eligibility = entry.get("eligibility", {})
+        section = eligibility.get("section")
+        if section:
+            out.append(f"建议章节: [{section['heading']}]({section['url']})（行 {section['line']}）。")
+        for evidence in eligibility.get("evidence", [])[:3]:
+            out.append(f"- 准入依据: {evidence['text']} — {evidence['url']}，行 {evidence['line']}。")
+        if entry.get("rules_url"):
+            out.append(f"贡献规则: {entry['rules_url']}")
+        submission = entry.get("submission", {})
+        if submission and entry.get("already_listed") is not True:
+            out += ["", f"PR 标题草稿: {submission.get('title', '')}", "", "````markdown", submission.get("entry", ""), "````",
+                    "", submission.get("body", "")]
+    out += ["", "## 宣传草稿与复查计划", ""]
+    for draft in report["promotion"]["drafts"]:
+        out += [f"### {draft['channel']}", "", f"受众: {draft['audience']}；目标: {draft['cta']}",
+                "", "````text", draft["text"], "````", ""]
+    for review in report["promotion"]["review"]:
+        out.append(f"- 第 {review['day']} 天: {review['action']}。")
+    out.append("\n草稿未发布，复查计划未创建定时任务。")
+    traffic = report.get("traffic")
+    if traffic:
+        out += ["", "## 流量快照", "", f"状态: {traffic['status']}；最近 14 天，UTC 口径。"]
+        for key in ("views", "clones"):
+            data = traffic.get(key)
+            out.append(f"- {key}: 总计 {cell(data.get('count') if data else None)}；窗口 unique {cell(data.get('uniques') if data else None)}。")
+        if traffic.get("archived_path"):
+            out.append(f"- 归档: `{traffic['archived_path']}`（按日期更新，不累加重叠窗口）。")
+        out.append("- 各日 unique 不可相加；来源榜不代表 Google/GitHub 搜索归因，流量变化不证明因果。")
+    out += ["", "## 限制与证据", ""] + [f"- {limitation}" for limitation in report["limitations"]]
+    out += ["", "*数据采集与事实观察分开；结构分、共现和渠道建议均不保证排名或曝光增长。*"]
     return "\n".join(out)
 
 
+def read_queries(path: str) -> list[str]:
+    text = Path(path).read_text(encoding="utf-8")
+    if text.lstrip().startswith("["):
+        values = json.loads(text)
+        if not isinstance(values, list) or any(not isinstance(q, str) for q in values):
+            raise ValueError("Query JSON must be a list of strings.")
+        return values
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="Full GitHub repo discoverability (SEO) report.",
-        epilog="Example: python analyze.py Royo-Qiao/Cloudflare-Edgetunnel --save report.md",
-    )
-    parser.add_argument("repo", help="owner/repo, GitHub URL, or local clone path")
-    parser.add_argument("--token", help="GitHub token override (prefer GH_TOKEN env)")
+    parser = argparse.ArgumentParser(description="GitHub readiness, search evidence, and promotion drafts.")
+    parser.add_argument("repo", nargs="?", help="owner/repo, GitHub URL, or local directory (offline mode needs no origin)")
+    parser.add_argument("--offline", action="store_true", help="read only local materials; no network, Git, or credential access")
+    parser.add_argument("--local-path", help="local directory, required for --offline unless given as the positional input")
+    parser.add_argument("--token", help="token override; prefer GH_TOKEN or gh auth")
     parser.add_argument("--provider", choices=["auto", "api", "gh"], default="auto")
-    parser.add_argument("--max-topics", type=int, default=8, help="topics to analyze (default 8)")
-    parser.add_argument("--top-n", type=int, default=15, help="topic-page window (default 15)")
-    parser.add_argument("--json", action="store_true", help="emit raw JSON instead of markdown")
-    parser.add_argument("--save", metavar="PATH", help="also write the report to a file")
+    parser.add_argument("--max-topics", type=int, default=8)
+    parser.add_argument("--top-n", type=int, default=15, help="topic Search API sample limit, 1-100")
+    parser.add_argument("--query", action="append", default=[])
+    parser.add_argument("--query-file")
+    parser.add_argument("--competitor", action="append", default=[])
+    parser.add_argument("--context", help="project context JSON")
+    parser.add_argument("--project-type", choices=PROJECT_TYPES, default="auto")
+    parser.add_argument("--baseline", help="previous v2 JSON report for the same repo")
+    parser.add_argument("--traffic-dir", help="explicitly collect and archive traffic under this directory")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--save", metavar="PATH")
     args = parser.parse_args()
-
-    token = get_token(args.token)
-    if not token:
-        print(token_setup_hint(), file=sys.stderr)
-        sys.exit(2)
-
+    if args.max_topics < 0 or not 1 <= args.top_n <= 100:
+        parser.error("--max-topics must be >= 0; --top-n must be between 1 and 100")
     try:
-        repo = resolve_repo(args.repo)
-        print(f"[1/5] metadata audit … ({repo})", file=sys.stderr)
-        report = build_report(repo, token=token, provider=args.provider,
-                              max_topics=args.max_topics, top_n=args.top_n)
-    except GitHubAPIError as exc:
+        if args.local_path and not args.offline:
+            raise ValueError("--local-path requires --offline; online local-clone input remains positional.")
+        local_path = args.local_path or (args.repo if args.repo and Path(args.repo).is_dir() else None)
+        if args.offline:
+            if not local_path:
+                raise ValueError("--offline requires --local-path PATH or a local directory as positional input.")
+            # A remote-looking input is a label only; never resolve Git origin offline.
+            repo = args.repo if args.repo and not Path(args.repo).is_dir() else f"local:{Path(local_path).resolve().name}"
+        else:
+            repo = resolve_repo(args.repo)
+        context = load_context(args.context) if args.context else None
+        queries = args.query + (read_queries(args.query_file) if args.query_file else [])
+        if args.offline and args.competitor:
+            raise ValueError("Offline audits cannot observe competitors.")
+        competitors = [resolve_repo(value) for value in args.competitor]
+        baseline = json.loads(Path(args.baseline).read_text(encoding="utf-8")) if args.baseline else None
+        token = "" if args.offline else get_token(args.token)
+        if not token and not args.offline:
+            print("No token: running basic metadata/README checks; Search API modules are skipped.", file=sys.stderr)
+        report = build_report(repo, token, args.provider, args.max_topics, args.top_n,
+                              queries=queries, competitors=competitors, context=context, project_type=args.project_type,
+                              baseline=baseline, traffic_dir=args.traffic_dir,
+                              local_path=local_path, offline=args.offline)
+        output = json.dumps(report, ensure_ascii=False, indent=2) if args.json else render_markdown(report)
+        if args.save:
+            Path(args.save).write_text(output + "\n", encoding="utf-8")
+        print(output)
+    except (GitHubAPIError, OSError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(2)
     except KeyboardInterrupt:
-        print("Interrupted.", file=sys.stderr)
         sys.exit(130)
-
-    if args.json:
-        text = json.dumps(report, indent=2, ensure_ascii=False)
-    else:
-        text = render_markdown(report)
-    print(text)
-    if args.save:
-        with open(args.save, "w", encoding="utf-8") as f:
-            f.write(text + "\n")
-        print(f"\n[saved] {args.save}", file=sys.stderr)
 
 
 if __name__ == "__main__":

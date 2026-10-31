@@ -1,0 +1,43 @@
+{
+  "skill_name": "github-repo-seo",
+  "evaluation_mode": "offline-fixture-regression; no model runs or real repository traffic",
+  "scope_notice": "These cases compare collector/script outputs only. They do not measure skill triggering, final LLM rewriting, or exposure changes. The original SKILL.md already asks the LLM to polish placeholder drafts; a raw old CLI placeholder failure does not establish failure of that final LLM output.",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "用离线模拟 fixture 分析 example/csv-json。仓库已有 12 个有效且适配的 topics，本次只采样前 8 个；不同关键词会重复返回两个独立可比仓库，它们都带 ai 标签，但目标仓库没有 AI 功能证据。给出 topic 建议，并解释采样和共现支持的边界。",
+      "expected_output": "保留全部 12 个有效 topics，包括未采样的 4 个；ai 只作为待语义审核的候选，不自动加入；共现支持按两个独立仓库计数，不按重复搜索命中次数计数。输出显式说明这是离线模拟数据。",
+      "files": [],
+      "assertions": [
+        "保留全部 12 个已有有效 topics，不因采样范围或拥挤而删除。",
+        "未采样的后 4 个 topics 仍保留在建议列表中。",
+        "ai 候选标记为待审核，且未自动加入建议 topics。",
+        "ai 共现支持计为 2 个独立仓库，而非重复关键词命中次数。"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "用离线模拟 fixture 分析 example/csv-json。基础元数据可读，但 README API 返回 403，awesome-list 搜索也返回 403。请交付报告，明确哪些信息未知，并保留错误证据。",
+      "expected_output": "README 不可获取时其得分未知，总体资料分未知；awesome 搜索失败不能解释为没有收录机会或打低分。报告展示两类 403 错误。输出显式说明这是离线模拟数据。",
+      "files": [],
+      "assertions": [
+        "README 403 显示为 unavailable，得分为 null，不能记作 0 分。",
+        "README 数据缺失时总体资料分为 null。",
+        "Awesome 搜索 403 显示为 unavailable，机会得分未知。",
+        "Markdown 报告中同时展示 README 和 Awesome 搜索的 403 错误证据。"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "用离线模拟 fixture 审查 example/csv-json，这是一个中文 README 的 Python CLI。README 有真实文档中的快速开始命令、示例输入和预期输出，没有截图或 badges。请按 CLI 类型给出建议，用已有项目简介起草文案，并明确命令尚未执行。",
+      "expected_output": "CLI 不因缺截图或 badges 收到视觉强制要求；识别中文快速开始和预期输出；描述和 README 开场使用实际简介，无占位符、假造 demo 路径或安装命令；明确仅检查文档，未执行命令。输出显式说明这是离线模拟数据。",
+      "files": [],
+      "assertions": [
+        "中文 CLI 不因缺少图片或 badges 收到 Critical/Warning 视觉要求。",
+        "中文快速开始和示例输出被识别，安装与证明类别未因此扣分。",
+        "宣传简介和 README 开场使用实际项目简介，没有占位符或假造 demo 资源。",
+        "报告明确文档中的命令未执行，未声称已验证运行成功。"
+      ]
+    }
+  ]
+}
